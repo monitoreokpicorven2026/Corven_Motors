@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-    <title>Control CFW500 - FAD (GitHub Pages)</title>
+    <title>Monitor CFW500 - FAD (GitHub Pages)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/moment@2.30.1/moment.min.js"></script>
@@ -44,13 +44,6 @@
             border-radius: 0.5rem;
         }
         .table-header { background-color: #3a3f51; color: #f18f01; }
-        @keyframes pulse-red {
-            0%, 100% { background-color: #b91c1c; }
-            50% { background-color: #ef4444; }
-        }
-        .alert-pulse {
-            animation: pulse-red 1s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-        }
     </style>
 </head>
 <body class="bg-[#2c2f3a] text-gray-100 min-h-screen">
@@ -77,16 +70,16 @@
 
     <script>
         // ------------------ CONFIGURACIÓN DE APIS Y INFLUXDB ------------------
-        // Ajusta la IP/Dominio público o túnel DuckDNS/ngrok de la Raspberry Pi para acciones de control
         const RASPBERRY_API_URL = "http://TU_PI_IP_O_DOMINIO:5000"; 
         
-        // Ajusta las credenciales de InfluxDB Cloud
         const INFLUX_URL = "https://us-east-1-1.aws.cloud2.influxdata.com"; 
         const INFLUX_TOKEN = "TU_INFLUX_TOKEN_AQUI";
         const INFLUX_ORG = "TU_ORGANIZACION";
         const INFLUX_BUCKET = "cfw500_monitoring";
 
-        // Función centralizada para consultas Flux a InfluxDB Cloud
+        // Variable global para almacenar los datos descargables del historial
+        let lastLoadedHistoryData = [];
+
         async function queryInflux(fluxQuery) {
             const url = `${INFLUX_URL}/api/v2/query?org=${encodeURIComponent(INFLUX_ORG)}`;
             const response = await fetch(url, {
@@ -108,7 +101,7 @@
         }
 
         function parseInfluxCSV(csvText) {
-            const lines = csvText.trim().split('\n').filter(line => !line.startswith('#') && line.trim() !== '');
+            const lines = csvText.trim().split('\n').filter(line => !line.startsWith('#') && line.trim() !== '');
             if (lines.length < 2) return [];
 
             const headers = lines[0].split(',');
@@ -128,52 +121,11 @@
             return results;
         }
 
-        const newControlPanelHTML = `
-            <div id="band-alert-banner" class="hidden alert-pulse p-4 rounded-lg mb-4 text-center font-bold text-white shadow-xl">
-                ⚠️ ¡ALERTA! FRECUENCIA DE REFERENCIA FUERA DE BANDA ⚠️
-            </div>
-
-            <hr class="my-4 border-gray-600">
-
-            <h3 class="text-xl font-semibold mb-3 text-yellow-300">1. Leer y Escribir Frecuencia de Referencia</h3>
-            <form id="set-ref-freq-form" class="space-y-3">
-                <div class="flex space-x-2">
-                    <input type="number" id="new-ref-freq" min="0.00" max="60.00" step="0.01" placeholder="Frecuencia (Hz, ej: 50.00)"
-                        class="flex-1 p-2 rounded bg-[#2c2f3a] border border-gray-600 focus:ring-[#f18f01] focus:border-[#f18f01] text-white" required>
-                    <input type="password" id="ref-freq-password" placeholder="Contraseña Admin" 
-                        class="w-32 p-2 rounded bg-[#2c2f3a] border border-gray-600 text-white" required>
-                </div>
-                <button type="submit" class="w-full bg-orange-600 hover:bg-orange-700 text-white font-bold py-2 px-4 rounded transition duration-200">
-                    Establecer Frecuencia
-                </button>
-                <p id="ref-freq-status" class="mt-2 text-sm text-center text-gray-400"></p>
-            </form>
-
-            <hr class="my-6 border-gray-600">
-
-            <h3 class="text-xl font-semibold mb-3 text-red-400">2. Modificar Banda de Alerta (<span id="current-band-limits">-- Hz</span>)</h3>
-            <form id="set-band-form" class="space-y-3">
-                <div class="grid grid-cols-2 gap-2">
-                    <input type="number" id="min-band" min="0.00" max="60.00" step="0.01" placeholder="Límite Mínimo (Hz)"
-                        class="p-2 rounded bg-[#2c2f3a] border border-gray-600 text-white" required>
-                    <input type="number" id="max-band" min="0.00" max="60.00" step="0.01" placeholder="Límite Máximo (Hz)"
-                        class="p-2 rounded bg-[#2c2f3a] border border-gray-600 text-white" required>
-                </div>
-                <input type="password" id="band-password" placeholder="Contraseña Admin" 
-                    class="w-full p-2 rounded bg-[#2c2f3a] border border-gray-600 text-white" required>
-                <button type="submit" class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded transition duration-200">
-                    Establecer Banda
-                </button>
-                <p id="band-status" class="mt-2 text-sm text-center text-gray-400"></p>
-            </form>
-        `;
-
         const mainContentHTML = `
             <div class="content-container">
-                <h1 class="text-3xl font-bold mb-6 text-white">Control del Variador CFW500</h1>
+                <h1 class="text-3xl font-bold mb-6 text-white">Monitoreo del Variador CFW500</h1>
 
                 <div class="grid grid-cols-1 gap-6">
-
                     <div id="params-card" class="card p-6 rounded-lg">
                         <h2 class="text-xl font-semibold mb-4 text-[#45e545]">Parámetros de Operación</h2>
                         <div class="space-y-4">
@@ -182,67 +134,23 @@
                                 <span id="actual-freq" class="font-mono text-2xl text-yellow-300">-- Hz</span>
                             </p>
                             <p class="flex justify-between items-center text-lg">
-                                <span>Frecuencia de Referencia:</span>
+                                <span>Frecuencia Objetivo (Referencia):</span>
                                 <span id="target-freq" class="font-mono text-2xl text-orange-400">-- Hz</span>
                             </p>
+                            <p class="flex justify-between items-center text-lg">
+                                <span>Rango de Banda Alerta:</span>
+                                <span id="current-band-limits" class="font-mono text-xl text-gray-300">-- Hz</span>
+                            </p>
                         </div>
-                        ${newControlPanelHTML}
                     </div>
                 </div>
 
                 <div id="safety-card" class="card p-6 rounded-lg mt-6">
                     <h2 class="text-xl font-semibold mb-4 text-yellow-500 flex items-center gap-2">
-                        Dias sin Accidentes
+                        Días sin Accidentes
                     </h2>
                     <p id="safety-status" class="text-2xl font-mono text-center mb-2">--</p>
                     <p id="last-accident-ts" class="text-sm text-center text-gray-400">Último incidente: --</p>
-                    <div class="text-center mt-4">
-                        <button id="reset-counter-btn" onclick="showResetModal()" 
-                            class="bg-red-700 hover:bg-red-800 text-white font-bold py-2 px-4 rounded transition duration-200 text-sm">
-                            Reiniciar Contador
-                        </button>
-                    </div>
-                </div>
-
-                <div id="accident-history-card" class="card p-6 rounded-lg mt-6">
-                    <h2 class="text-xl font-semibold mb-4 text-red-400 flex items-center gap-2">
-                        Historial de Reinicios de Seguridad
-                    </h2>
-                    <div class="overflow-x-auto shadow-md rounded-lg">
-                        <table class="min-w-full divide-y divide-gray-600">
-                            <thead class="table-header bg-red-800/50">
-                                <tr>
-                                    <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-red-300">Fecha y Hora</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-red-300">Motivo del Reinicio</th>
-                                </tr>
-                            </thead>
-                            <tbody id="accident-history-list" class="bg-[#2c2f3a] divide-y divide-gray-700">
-                                <tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">Cargando historial...</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                    <p id="accident-history-status" class="mt-4 text-sm text-center text-gray-400"></p>
-                </div>
-            </div>
-
-            <div id="reset-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center z-50">
-                <div class="bg-gray-700 p-6 rounded-lg w-96">
-                    <h3 class="text-xl font-bold mb-4">Confirmar Reinicio</h3>
-                    <p class="mb-4">Ingrese la contraseña de administrador y la razón del reinicio del contador de seguridad.</p>
-                    <input type="password" id="admin-password-input" placeholder="Contraseña de Administrador"
-                        class="w-full p-2 mb-3 rounded bg-gray-800 border border-gray-600 text-white">
-                    <textarea id="reset-reason-input" rows="3" placeholder="Razón del Accidente/Reinicio"
-                        class="w-full p-2 mb-4 rounded bg-gray-800 border border-gray-600 text-white"></textarea>
-                    
-                    <div class="flex justify-end space-x-3">
-                        <button onclick="hideResetModal()" class="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">
-                            Cancelar
-                        </button>
-                        <button onclick="resetCounter()" class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded">
-                            Confirmar Reinicio
-                        </button>
-                    </div>
-                    <p id="modal-status" class="mt-4 text-center text-sm font-semibold"></p>
                 </div>
             </div>
         `;
@@ -252,10 +160,10 @@
                 <h1 class="text-3xl font-bold mb-6 text-white">Reportes de Frecuencia (InfluxDB Cloud)</h1>
                 
                 <div class="card p-4 rounded-lg mb-6">
-                    <h2 class="text-xl font-semibold mb-2 text-[#45e545]">Frecuencia en Tiempo Real (Un_Hs)</h2>
+                    <h2 class="text-xl font-semibold mb-2 text-[#45e545]">Frecuencia en Tiempo Real</h2>
                     
                     <div class="flex justify-between items-center mb-4"> 
-                        <p class="text-sm text-gray-400">Datos leídos directamente de InfluxDB Cloud.</p>
+                        <p class="text-sm text-gray-400">Datos leídos directamente desde InfluxDB Cloud.</p>
                         <button onclick="resetZoom()" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-1 px-3 rounded text-sm transition duration-200 flex items-center gap-1">
                             Reiniciar Zoom
                         </button>
@@ -285,7 +193,13 @@
 
         const historyContentHTML = `
             <div class="content-container">
-                <h1 class="text-3xl font-bold mb-6 text-white">Historial de Frecuencia (InfluxDB Cloud)</h1>
+                <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 gap-4">
+                    <h1 class="text-3xl font-bold text-white">Historial de Frecuencia (InfluxDB Cloud)</h1>
+                    <button onclick="downloadCSV()" class="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded transition duration-200 flex items-center gap-2">
+                        📥 Descargar CSV
+                    </button>
+                </div>
+
                 <div class="card p-6 rounded-lg">
                     <div class="overflow-x-auto shadow-md rounded-lg">
                         <table class="min-w-full divide-y divide-gray-600">
@@ -321,116 +235,18 @@
                     if (currentBandLimits) {
                         currentBandLimits.textContent = `${data.min_band.toFixed(2)} - ${data.max_band.toFixed(2)} Hz`;
                     }
-
-                    const alertBanner = document.getElementById('band-alert-banner');
-                    const paramsCard = document.getElementById('params-card');
-
-                    if (data.alert_active) {
-                        if (alertBanner) alertBanner.classList.remove('hidden');
-                        if (paramsCard) paramsCard.classList.add('border-4', 'border-red-700');
-                    } else {
-                        if (alertBanner) alertBanner.classList.add('hidden');
-                        if (paramsCard) paramsCard.classList.remove('border-4', 'border-red-700');
-                    }
                 }
             } catch (error) {
                 console.error('Error al actualizar estado:', error);
             }
         }
 
-        async function setRefFrequency(event) {
-            event.preventDefault();
-            const statusEl = document.getElementById('ref-freq-status');
-            const newFreq = document.getElementById('new-ref-freq').value;
-            const password = document.getElementById('ref-freq-password').value;
-
-            if (statusEl) {
-                statusEl.textContent = 'Enviando comando a Raspberry Pi...';
-                statusEl.className = 'mt-2 text-sm text-center text-yellow-300';
-            }
-            
-            try {
-                const response = await fetch(`${RASPBERRY_API_URL}/api/set_ref_freq`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ frequency: parseFloat(newFreq), password: password })
-                });
-                const data = await response.json();
-
-                if (response.ok && data.ok) {
-                    if (statusEl) {
-                        statusEl.textContent = data.message;
-                        statusEl.className = 'mt-2 text-sm text-center text-green-500';
-                    }
-                    updateStatus();
-                } else {
-                    if (statusEl) {
-                        statusEl.textContent = `Error: ${data.error || data.message || 'Error desconocido'}`;
-                        statusEl.className = 'mt-2 text-sm text-center text-red-500';
-                    }
-                }
-            } catch (error) {
-                if (statusEl) {
-                    statusEl.textContent = 'Error de comunicación con la Raspberry Pi.';
-                    statusEl.className = 'mt-2 text-sm text-center text-red-500';
-                }
-            }
-        }
-
-        async function setBandLimits(event) {
-            event.preventDefault();
-            const statusEl = document.getElementById('band-status');
-            const minBand = document.getElementById('min-band').value;
-            const maxBand = document.getElementById('max-band').value;
-            const password = document.getElementById('band-password').value;
-
-            if (statusEl) {
-                statusEl.textContent = 'Estableciendo...';
-                statusEl.className = 'mt-2 text-sm text-center text-yellow-300';
-            }
-            
-            try {
-                const response = await fetch(`${RASPBERRY_API_URL}/set_band`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ min_band: parseFloat(minBand), max_band: parseFloat(maxBand), password: password })
-                });
-                const data = await response.json();
-
-                if (response.ok && data.ok) {
-                    if (statusEl) {
-                        statusEl.textContent = data.message;
-                        statusEl.className = 'mt-2 text-sm text-center text-green-500';
-                    }
-                    updateStatus();
-                } else {
-                    if (statusEl) {
-                        statusEl.textContent = `Error: ${data.message || 'Error desconocido'}`;
-                        statusEl.className = 'mt-2 text-sm text-center text-red-500';
-                    }
-                }
-            } catch (error) {
-                if (statusEl) {
-                    statusEl.textContent = 'Error de conexión con la Raspberry Pi.';
-                    statusEl.className = 'mt-2 text-sm text-center text-red-500';
-                }
-            }
-        }
-
         function setupMainPage() {
-            const refForm = document.getElementById('set-ref-freq-form');
-            if (refForm) refForm.addEventListener('submit', setRefFrequency);
-            
-            const bandForm = document.getElementById('set-band-form');
-            if (bandForm) bandForm.addEventListener('submit', setBandLimits);
-
             updateStatus(); 
             if (!window.statusInterval) {
                 window.statusInterval = setInterval(updateStatus, 3000); 
             }
-
             getSafetyStatus(); 
-            getAccidentHistory(); 
         }
 
         window.loadPage = (page) => {
@@ -476,79 +292,6 @@
                 if (lastEl) lastEl.textContent = `Último incidente: ${lastTs}`;
             } catch (error) {
                 console.error('Error al obtener estado de seguridad:', error);
-            }
-        }
-
-        async function getAccidentHistory() {
-            const listEl = document.getElementById('accident-history-list');
-            if (!listEl) return; 
-
-            try {
-                const response = await fetch(`${RASPBERRY_API_URL}/api/accident_history`);
-                const history = await response.json();
-
-                listEl.innerHTML = '';
-                if (!history || history.length === 0) {
-                    listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">No hay historial de reinicios.</td></tr>';
-                    return;
-                }
-
-                history.forEach(item => {
-                    const row = `
-                        <tr class="hover:bg-[#3a3f51]">
-                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-300">${item.timestamp}</td>
-                            <td class="px-6 py-4 text-sm text-gray-400">${item.reason}</td>
-                        </tr>
-                    `;
-                    listEl.innerHTML += row;
-                });
-
-            } catch (error) {
-                listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-red-500">Error cargando historial.</td></tr>';
-            }
-        }
-
-        function showResetModal() {
-            document.getElementById('reset-modal').classList.remove('hidden');
-        }
-
-        function hideResetModal() {
-            document.getElementById('reset-modal').classList.add('hidden');
-        }
-
-        async function resetCounter() {
-            const password = document.getElementById('admin-password-input').value;
-            const reason = document.getElementById('reset-reason-input').value;
-            const modalStatus = document.getElementById('modal-status');
-            
-            if (!password || !reason) {
-                modalStatus.textContent = 'Ingrese la contraseña y el motivo.';
-                modalStatus.className = 'mt-4 text-center text-sm font-semibold text-yellow-400';
-                return;
-            }
-
-            try {
-                const response = await fetch(`${RASPBERRY_API_URL}/api/reset_accident_counter`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password, reason })
-                });
-
-                const result = await response.json();
-
-                if (response.ok && result.ok) {
-                    modalStatus.textContent = `✅ Contador Reiniciado.`;
-                    modalStatus.className = 'mt-4 text-center text-sm font-semibold text-green-400';
-                    getSafetyStatus();
-                    getAccidentHistory();
-                    setTimeout(hideResetModal, 2000);
-                } else {
-                    modalStatus.textContent = `❌ ${result.message || result.error}`;
-                    modalStatus.className = 'mt-4 text-center text-sm font-semibold text-red-500';
-                }
-            } catch (error) {
-                modalStatus.textContent = `❌ Error de conexión.`;
-                modalStatus.className = 'mt-4 text-center text-sm font-semibold text-red-500';
             }
         }
 
@@ -755,6 +498,7 @@
                         |> limit(n: 500)
                 `;
                 const data = await queryInflux(fluxQuery);
+                lastLoadedHistoryData = data; // Guarda en memoria para descarga CSV
                 
                 listEl.innerHTML = '';
                 if (!data || data.length === 0) {
@@ -779,6 +523,29 @@
                 listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-red-500">Error cargando historial desde InfluxDB Cloud.</td></tr>';
                 if (statusEl) statusEl.textContent = 'Error al cargar datos.';
             }
+        }
+
+        // Función para descargar los datos cargados a un archivo .CSV
+        function downloadCSV() {
+            if (!lastLoadedHistoryData || lastLoadedHistoryData.length === 0) {
+                alert("No hay datos disponibles para descargar. Ve a la pestaña Historial primero.");
+                return;
+            }
+
+            let csvContent = "data:text/csv;charset=utf-8,Timestamp,Frecuencia_Hz\n";
+
+            lastLoadedHistoryData.forEach(item => {
+                const formattedTime = moment(item.ts).format('YYYY-MM-DD HH:mm:ss');
+                csvContent += `${formattedTime},${item.value.toFixed(2)}\n`;
+            });
+
+            const encodedUri = encodeURI(csvContent);
+            const link = document.createElement("a");
+            link.setAttribute("href", encodedUri);
+            link.setAttribute("download", `frecuencia_cfw500_${moment().format('YYYYMMDD_HHmmss')}.csv`);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
         }
         
         document.addEventListener('DOMContentLoaded', () => {
