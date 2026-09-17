@@ -3,20 +3,19 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-    <title>Monitor CFW500 - FAD (Solo Lectura)</title>
+    <title>Control CFW500 - FAD (GitHub Pages)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/moment@2.30.1/moment.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-moment@1.0.1/dist/chartjs-adapter-moment.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
     <style>
-        /* Personalización mínima */
         body { font-family: 'Inter', sans-serif; }
         .sidebar { background-color: #3a3f51; }
         .card { 
             background-color: #343842; 
             box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2); 
-            border-radius: 0.5rem; /* Bordes redondeados */
+            border-radius: 0.5rem; 
         }
         .menu-item {
             display: flex;
@@ -35,7 +34,6 @@
             border-left: 4px solid #f18f01;
             font-weight: 600;
         }
-        /* Estilos específicos para los gráficos en la página de Reportes */
         .chart-container {
             position: relative;
             height: 40vh;
@@ -45,9 +43,7 @@
             background-color: #2c2f3a;
             border-radius: 0.5rem;
         }
-        /* Estilos para la tabla de historial */
         .table-header { background-color: #3a3f51; color: #f18f01; }
-        /* Animación de pulso para la alerta */
         @keyframes pulse-red {
             0%, 100% { background-color: #b91c1c; }
             50% { background-color: #ef4444; }
@@ -61,7 +57,7 @@
 
     <div class="flex flex-col lg:flex-row min-h-screen">
         <aside class="sidebar lg:w-64 p-6 flex flex-col gap-6 lg:h-auto h-20">
-            <div class="text-2xl font-bold text-white lg:mb-8 hidden lg:block">FAD</div>
+            <div class="text-2xl font-bold text-white lg:mb-8 hidden lg:block">FAD Cloud</div>
             <nav class="flex lg:flex-col space-x-4 lg:space-x-0 lg:space-y-3 font-semibold text-gray-400">
                 <a id="nav-main" class="menu-item active" onclick="loadPage('main')">
                     <span>Principal</span>
@@ -80,14 +76,58 @@
     </div>
 
     <script>
-        // ======================================================================
-        // IMPORTANTE: reemplazá esta URL por la de tu backend (Tailscale/DDNS).
-        // Esta página es de SOLO LECTURA: no incluye ninguna ruta de escritura.
-        // ======================================================================
-        const API_BASE = 'https://TU-DOMINIO-O-TAILSCALE-AQUI';
+        // ------------------ CONFIGURACIÓN DE APIS Y INFLUXDB ------------------
+        // Ajusta la IP/Dominio público o túnel DuckDNS/ngrok de la Raspberry Pi para acciones de control
+        const RASPBERRY_API_URL = "http://TU_PI_IP_O_DOMINIO:5000"; 
+        
+        // Ajusta las credenciales de InfluxDB Cloud
+        const INFLUX_URL = "https://us-east-1-1.aws.cloud2.influxdata.com"; 
+        const INFLUX_TOKEN = "TU_INFLUX_TOKEN_AQUI";
+        const INFLUX_ORG = "TU_ORGANIZACION";
+        const INFLUX_BUCKET = "cfw500_monitoring";
 
-        // Panel de solo lectura: sin formularios de escritura.
-        // La modificación de frecuencia/banda queda exclusivamente en la página LOCAL (LAN/Tailscale).
+        // Función centralizada para consultas Flux a InfluxDB Cloud
+        async function queryInflux(fluxQuery) {
+            const url = `${INFLUX_URL}/api/v2/query?org=${encodeURIComponent(INFLUX_ORG)}`;
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Token ${INFLUX_TOKEN}`,
+                    'Content-Type': 'application/flux',
+                    'Accept': 'application/csv'
+                },
+                body: fluxQuery
+            });
+
+            if (!response.ok) {
+                throw new Error(`InfluxDB Query Error: ${response.statusText}`);
+            }
+
+            const csvText = await response.text();
+            return parseInfluxCSV(csvText);
+        }
+
+        function parseInfluxCSV(csvText) {
+            const lines = csvText.trim().split('\n').filter(line => !line.startswith('#') && line.trim() !== '');
+            if (lines.length < 2) return [];
+
+            const headers = lines[0].split(',');
+            const timeIdx = headers.indexOf('_time');
+            const valueIdx = headers.indexOf('_value');
+
+            const results = [];
+            for (let i = 1; i < lines.length; i++) {
+                const cols = lines[i].split(',');
+                if (cols[timeIdx] && cols[valueIdx]) {
+                    results.push({
+                        ts: cols[timeIdx],
+                        value: parseFloat(cols[valueIdx])
+                    });
+                }
+            }
+            return results;
+        }
+
         const newControlPanelHTML = `
             <div id="band-alert-banner" class="hidden alert-pulse p-4 rounded-lg mb-4 text-center font-bold text-white shadow-xl">
                 ⚠️ ¡ALERTA! FRECUENCIA DE REFERENCIA FUERA DE BANDA ⚠️
@@ -95,18 +135,39 @@
 
             <hr class="my-4 border-gray-600">
 
-            <div class="flex justify-between items-center text-sm text-gray-300 bg-[#2c2f3a] p-3 rounded">
-                <span>Banda de Alerta configurada:</span>
-                <span id="current-band-limits" class="font-mono text-gray-200">-- Hz</span>
-            </div>
-            <p class="mt-3 text-xs text-center text-gray-500">
-                Esta es una vista de solo lectura. La modificación de parámetros solo está disponible desde la red local.
-            </p>
+            <h3 class="text-xl font-semibold mb-3 text-yellow-300">1. Leer y Escribir Frecuencia de Referencia</h3>
+            <form id="set-ref-freq-form" class="space-y-3">
+                <div class="flex space-x-2">
+                    <input type="number" id="new-ref-freq" min="0.00" max="60.00" step="0.01" placeholder="Frecuencia (Hz, ej: 50.00)"
+                        class="flex-1 p-2 rounded bg-[#2c2f3a] border border-gray-600 focus:ring-[#f18f01] focus:border-[#f18f01] text-white" required>
+                    <input type="password" id="ref-freq-password" placeholder="Contraseña Admin" 
+                        class="w-32 p-2 rounded bg-[#2c2f3a] border border-gray-600 text-white" required>
+                </div>
+                <button type="submit" class="w-full bg-orange-600 hover:bg-orange-700 text-white font-bold py-2 px-4 rounded transition duration-200">
+                    Establecer Frecuencia
+                </button>
+                <p id="ref-freq-status" class="mt-2 text-sm text-center text-gray-400"></p>
+            </form>
+
+            <hr class="my-6 border-gray-600">
+
+            <h3 class="text-xl font-semibold mb-3 text-red-400">2. Modificar Banda de Alerta (<span id="current-band-limits">-- Hz</span>)</h3>
+            <form id="set-band-form" class="space-y-3">
+                <div class="grid grid-cols-2 gap-2">
+                    <input type="number" id="min-band" min="0.00" max="60.00" step="0.01" placeholder="Límite Mínimo (Hz)"
+                        class="p-2 rounded bg-[#2c2f3a] border border-gray-600 text-white" required>
+                    <input type="number" id="max-band" min="0.00" max="60.00" step="0.01" placeholder="Límite Máximo (Hz)"
+                        class="p-2 rounded bg-[#2c2f3a] border border-gray-600 text-white" required>
+                </div>
+                <input type="password" id="band-password" placeholder="Contraseña Admin" 
+                    class="w-full p-2 rounded bg-[#2c2f3a] border border-gray-600 text-white" required>
+                <button type="submit" class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded transition duration-200">
+                    Establecer Banda
+                </button>
+                <p id="band-status" class="mt-2 text-sm text-center text-gray-400"></p>
+            </form>
         `;
 
-        // --- DEFINICIÓN DE CONTENIDOS DE PÁGINA ---
-
-        // 1. Contenido de la página PRINCIPAL (Control del variador)
         const mainContentHTML = `
             <div class="content-container">
                 <h1 class="text-3xl font-bold mb-6 text-white">Control del Variador CFW500</h1>
@@ -135,6 +196,12 @@
                     </h2>
                     <p id="safety-status" class="text-2xl font-mono text-center mb-2">--</p>
                     <p id="last-accident-ts" class="text-sm text-center text-gray-400">Último incidente: --</p>
+                    <div class="text-center mt-4">
+                        <button id="reset-counter-btn" onclick="showResetModal()" 
+                            class="bg-red-700 hover:bg-red-800 text-white font-bold py-2 px-4 rounded transition duration-200 text-sm">
+                            Reiniciar Contador
+                        </button>
+                    </div>
                 </div>
 
                 <div id="accident-history-card" class="card p-6 rounded-lg mt-6">
@@ -158,18 +225,37 @@
                 </div>
             </div>
 
+            <div id="reset-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center z-50">
+                <div class="bg-gray-700 p-6 rounded-lg w-96">
+                    <h3 class="text-xl font-bold mb-4">Confirmar Reinicio</h3>
+                    <p class="mb-4">Ingrese la contraseña de administrador y la razón del reinicio del contador de seguridad.</p>
+                    <input type="password" id="admin-password-input" placeholder="Contraseña de Administrador"
+                        class="w-full p-2 mb-3 rounded bg-gray-800 border border-gray-600 text-white">
+                    <textarea id="reset-reason-input" rows="3" placeholder="Razón del Accidente/Reinicio"
+                        class="w-full p-2 mb-4 rounded bg-gray-800 border border-gray-600 text-white"></textarea>
+                    
+                    <div class="flex justify-end space-x-3">
+                        <button onclick="hideResetModal()" class="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded">
+                            Cancelar
+                        </button>
+                        <button onclick="resetCounter()" class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded">
+                            Confirmar Reinicio
+                        </button>
+                    </div>
+                    <p id="modal-status" class="mt-4 text-center text-sm font-semibold"></p>
+                </div>
+            </div>
         `;
 
-        // 2. Contenido de la página REPORTES (Gráficos)
         const reportsContentHTML = `
             <div class="content-container">
-                <h1 class="text-3xl font-bold mb-6 text-white">Reportes de Frecuencia y Seguridad</h1>
+                <h1 class="text-3xl font-bold mb-6 text-white">Reportes de Frecuencia (InfluxDB Cloud)</h1>
                 
                 <div class="card p-4 rounded-lg mb-6">
                     <h2 class="text-xl font-semibold mb-2 text-[#45e545]">Frecuencia en Tiempo Real (Un_Hs)</h2>
                     
                     <div class="flex justify-between items-center mb-4"> 
-                        <p class="text-sm text-gray-400">Muestra la frecuencia completa. Usa el zoom (rueda del ratón) y desplazamiento (clic y arrastrar) para explorar.</p>
+                        <p class="text-sm text-gray-400">Datos leídos directamente de InfluxDB Cloud.</p>
                         <button onclick="resetZoom()" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-1 px-3 rounded text-sm transition duration-200 flex items-center gap-1">
                             Reiniciar Zoom
                         </button>
@@ -194,40 +280,13 @@
                         </div>
                     </div>
                 </div>
-
             </div>
         `;
 
-        // 3. Contenido de la página HISTORIAL DE FRECUENCIA
         const historyContentHTML = `
             <div class="content-container">
-                <h1 class="text-3xl font-bold mb-6 text-white">Historial de Frecuencia Detallado</h1>
+                <h1 class="text-3xl font-bold mb-6 text-white">Historial de Frecuencia (InfluxDB Cloud)</h1>
                 <div class="card p-6 rounded-lg">
-                    
-                    <div class="mb-6 border border-gray-600 p-4 rounded bg-[#3a3f51]">
-                        <h3 class="text-lg font-semibold mb-3 text-[#45e545]">Descarga de Datos por Período</h3>
-                        <p class="text-sm text-gray-300 mb-4">Seleccione un rango de fechas para descargar solo los registros necesarios. Esto permite obtener el historial completo sin límites de registros.</p>
-                        <div class="flex flex-col md:flex-row gap-4 items-end">
-                            <div class="flex-1 w-full">
-                                <label for="start-date-input" class="block mb-1 text-sm font-medium">Fecha de Inicio (YYYY-MM-DD):</label>
-                                <input type="date" id="start-date-input" class="w-full p-2 rounded bg-[#2c2f3a] border border-gray-600 text-white">
-                            </div>
-                            <div class="flex-1 w-full">
-                                <label for="end-date-input" class="block mb-1 text-sm font-medium">Fecha de Fin (YYYY-MM-DD):</label>
-                                <input type="date" id="end-date-input" class="w-full p-2 rounded bg-[#2c2f3a] border border-gray-600 text-white">
-                            </div>
-                            <button id="download-range-btn" onclick="exportFrequencyHistoryByRange()" class="w-full md:w-auto bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded transition duration-200 text-sm flex items-center justify-center gap-1 mt-2 md:mt-0">
-                                Descargar Rango
-                            </button>
-                        </div>
-                    </div>
-                    <div class="flex justify-between items-center mb-4 flex-col sm:flex-row border-t border-gray-700 pt-4">
-                        <p id="status-message" class="mb-2 sm:mb-0 text-sm text-gray-400">Mostrando los últimos 500 registros. Use la opción superior para obtener el historial completo.</p>
-                        <button id="download-history-btn" onclick="exportAllFrequencyHistoryToCSV()" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition duration-200 text-sm flex items-center gap-1">
-                            Descargar TODO
-                        </button>
-                    </div>
-                    
                     <div class="overflow-x-auto shadow-md rounded-lg">
                         <table class="min-w-full divide-y divide-gray-600">
                             <thead class="table-header">
@@ -237,7 +296,7 @@
                                 </tr>
                             </thead>
                             <tbody id="frequency-history-list" class="bg-[#2c2f3a] divide-y divide-gray-700">
-                                <tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">No hay datos disponibles para mostrar.</td></tr>
+                                <tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">Cargando datos desde InfluxDB Cloud...</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -247,30 +306,22 @@
             </div>
         `;
 
-        // --- FUNCIONES Y LÓGICA DE CONTROL ---
-
-        // Función de polling para actualizar el estado
         async function updateStatus() {
             try {
-                const response = await fetch('/status');
+                const response = await fetch(`${RASPBERRY_API_URL}/status`);
                 const data = await response.json();
 
                 if (data.ok) {
                     const actualEl = document.getElementById('actual-freq');
                     const targetEl = document.getElementById('target-freq');
-                    const Un_Hs = (data.measured_freq).toFixed(2);
-                    if (actualEl) actualEl.textContent = `${Un_Hs} Un_Hs`;
-
+                    if (actualEl) actualEl.textContent = `${data.measured_freq.toFixed(2)} Hz`;
                     if (targetEl) targetEl.textContent = `${data.ref_freq.toFixed(2)} Hz`;
 
-                    
-                    // Actualizar límites de banda en el panel de control
                     const currentBandLimits = document.getElementById('current-band-limits');
                     if (currentBandLimits) {
                         currentBandLimits.textContent = `${data.min_band.toFixed(2)} - ${data.max_band.toFixed(2)} Hz`;
                     }
 
-                    // Lógica de alerta visual (Banner rojo)
                     const alertBanner = document.getElementById('band-alert-banner');
                     const paramsCard = document.getElementById('params-card');
 
@@ -283,29 +334,105 @@
                     }
                 }
             } catch (error) {
-                console.error('Error fetching status:', error);
+                console.error('Error al actualizar estado:', error);
             }
         }
 
-        // Función de inicialización de la página 'main'
-        // (Sin listeners de escritura: esta página es solo lectura)
+        async function setRefFrequency(event) {
+            event.preventDefault();
+            const statusEl = document.getElementById('ref-freq-status');
+            const newFreq = document.getElementById('new-ref-freq').value;
+            const password = document.getElementById('ref-freq-password').value;
+
+            if (statusEl) {
+                statusEl.textContent = 'Enviando comando a Raspberry Pi...';
+                statusEl.className = 'mt-2 text-sm text-center text-yellow-300';
+            }
+            
+            try {
+                const response = await fetch(`${RASPBERRY_API_URL}/api/set_ref_freq`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ frequency: parseFloat(newFreq), password: password })
+                });
+                const data = await response.json();
+
+                if (response.ok && data.ok) {
+                    if (statusEl) {
+                        statusEl.textContent = data.message;
+                        statusEl.className = 'mt-2 text-sm text-center text-green-500';
+                    }
+                    updateStatus();
+                } else {
+                    if (statusEl) {
+                        statusEl.textContent = `Error: ${data.error || data.message || 'Error desconocido'}`;
+                        statusEl.className = 'mt-2 text-sm text-center text-red-500';
+                    }
+                }
+            } catch (error) {
+                if (statusEl) {
+                    statusEl.textContent = 'Error de comunicación con la Raspberry Pi.';
+                    statusEl.className = 'mt-2 text-sm text-center text-red-500';
+                }
+            }
+        }
+
+        async function setBandLimits(event) {
+            event.preventDefault();
+            const statusEl = document.getElementById('band-status');
+            const minBand = document.getElementById('min-band').value;
+            const maxBand = document.getElementById('max-band').value;
+            const password = document.getElementById('band-password').value;
+
+            if (statusEl) {
+                statusEl.textContent = 'Estableciendo...';
+                statusEl.className = 'mt-2 text-sm text-center text-yellow-300';
+            }
+            
+            try {
+                const response = await fetch(`${RASPBERRY_API_URL}/set_band`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ min_band: parseFloat(minBand), max_band: parseFloat(maxBand), password: password })
+                });
+                const data = await response.json();
+
+                if (response.ok && data.ok) {
+                    if (statusEl) {
+                        statusEl.textContent = data.message;
+                        statusEl.className = 'mt-2 text-sm text-center text-green-500';
+                    }
+                    updateStatus();
+                } else {
+                    if (statusEl) {
+                        statusEl.textContent = `Error: ${data.message || 'Error desconocido'}`;
+                        statusEl.className = 'mt-2 text-sm text-center text-red-500';
+                    }
+                }
+            } catch (error) {
+                if (statusEl) {
+                    statusEl.textContent = 'Error de conexión con la Raspberry Pi.';
+                    statusEl.className = 'mt-2 text-sm text-center text-red-500';
+                }
+            }
+        }
+
         function setupMainPage() {
+            const refForm = document.getElementById('set-ref-freq-form');
+            if (refForm) refForm.addEventListener('submit', setRefFrequency);
             
             const bandForm = document.getElementById('set-band-form');
             if (bandForm) bandForm.addEventListener('submit', setBandLimits);
 
-            // Iniciar la actualización de estado y el polling
             updateStatus(); 
-            if (!window.statusInterval) { // Prevenir múltiples intervalos
+            if (!window.statusInterval) {
                 window.statusInterval = setInterval(updateStatus, 3000); 
             }
 
-            // Llamar a las funciones de seguridad y historial
             getSafetyStatus(); 
             getAccidentHistory(); 
         }
 
-        // Sobrescribir la función loadPage para incluir la lógica de setup
         window.loadPage = (page) => {
             const contentEl = document.getElementById('page-content');
             
@@ -315,7 +442,6 @@
             } else if (page === 'reports') {
                 contentEl.innerHTML = reportsContentHTML;
                 setTimeout(() => {
-                    // Esperar a que el DOM se renderice antes de inicializar Chart.js
                     initRealTimeChart();
                     initHourlyChart();
                     initMonthlyChart();
@@ -325,39 +451,31 @@
                 getFrequencyHistory(); 
             }
 
-            // Actualizar clases de navegación
             document.querySelectorAll('.menu-item').forEach(item => {
                 item.classList.remove('active');
             });
             const navItem = document.getElementById(`nav-${page}`);
             if(navItem) navItem.classList.add('active');
 
-            // Detener polling al salir de la página principal 
             if (page !== 'main' && window.statusInterval) {
                  clearInterval(window.statusInterval);
                  window.statusInterval = null;
             }
         }
 
-        // --- FUNCIONES DE SEGURIDAD (IMPLEMENTADAS) ---
-
         async function getSafetyStatus() {
             try {
-                const response = await fetch('/api/time_since_accident');
+                const response = await fetch(`${RASPBERRY_API_URL}/api/time_since_accident`);
                 const data = await response.json();
-
-                // manejar varios posibles nombres de campos que pueda enviar el backend
-                const days = (data && (data.days_since ?? data.daysSince ?? data.days)) ?? '--';
-                const lastTs = (data && (data.last_ts || data.last_accident_ts || data.lastAccidentTs)) || '--';
+                const days = data.days_since ?? '--';
+                const lastTs = data.last_accident_ts ?? '--';
                 
                 const safetyEl = document.getElementById('safety-status');
                 const lastEl = document.getElementById('last-accident-ts');
                 if (safetyEl) safetyEl.textContent = `${days} días`;
                 if (lastEl) lastEl.textContent = `Último incidente: ${lastTs}`;
             } catch (error) {
-                console.error('Error fetching safety status:', error);
-                const safetyEl = document.getElementById('safety-status');
-                if (safetyEl) safetyEl.textContent = '--';
+                console.error('Error al obtener estado de seguridad:', error);
             }
         }
 
@@ -366,37 +484,32 @@
             if (!listEl) return; 
 
             try {
-                const response = await fetch('/api/accident_history');
+                const response = await fetch(`${RASPBERRY_API_URL}/api/accident_history`);
                 const history = await response.json();
 
-                listEl.innerHTML = ''; // Limpiar
+                listEl.innerHTML = '';
                 if (!history || history.length === 0) {
                     listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">No hay historial de reinicios.</td></tr>';
                     return;
                 }
 
                 history.forEach(item => {
-                    const ts = item.timestamp || item.reset_ts || item.ts || '';
                     const row = `
                         <tr class="hover:bg-[#3a3f51]">
-                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-300">${ts}</td>
-                            <td class="px-6 py-4 text-sm text-gray-400">${item.reason || item.motivo || ''}</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-300">${item.timestamp}</td>
+                            <td class="px-6 py-4 text-sm text-gray-400">${item.reason}</td>
                         </tr>
                     `;
                     listEl.innerHTML += row;
                 });
 
             } catch (error) {
-                console.error('Error fetching accident history:', error);
                 listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-red-500">Error cargando historial.</td></tr>';
             }
         }
 
         function showResetModal() {
             document.getElementById('reset-modal').classList.remove('hidden');
-            document.getElementById('modal-status').textContent = '';
-            document.getElementById('admin-password-input').value = '';
-            document.getElementById('reset-reason-input').value = '';
         }
 
         function hideResetModal() {
@@ -404,70 +517,40 @@
         }
 
         async function resetCounter() {
-    const password = document.getElementById('admin-password-input').value;
-    const reason = document.getElementById('reset-reason-input').value;
-    const modalStatus = document.getElementById('modal-status');
-    
-    // 1. Validación básica (ya estaba correcta)
-    if (!password || !reason) {
-        modalStatus.textContent = 'Ingrese la contraseña y el motivo.';
-        modalStatus.className = 'mt-4 text-center text-sm font-semibold text-yellow-400';
-        return;
-    }
-    
-    modalStatus.textContent = 'Reiniciando...';
-    modalStatus.className = 'mt-4 text-center text-sm font-semibold text-yellow-300';
-
-    try {
-        // 2. Realizar la petición POST
-        const response = await fetch('/api/reset_accident_counter', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ password, reason }) // Envía 'password' y 'reason'
-        });
-
-        const result = await response.json(); // Intentar leer el JSON de la respuesta
-
-        // 3. Manejo de la respuesta del servidor
-        if (response.ok) {
-            // Éxito: Código 200/201 y 'ok: true'
-            modalStatus.textContent = `✅ Contador Reiniciado. Último registro: ${new Date(result.new_ts).toLocaleString()}`;
-            modalStatus.className = 'mt-4 text-center text-sm font-semibold text-green-400';
+            const password = document.getElementById('admin-password-input').value;
+            const reason = document.getElementById('reset-reason-input').value;
+            const modalStatus = document.getElementById('modal-status');
             
-            // Opcional: Recargar los datos de la UI principal (asumiendo que tienes una función updateStatus())
-            await updateStatus(); 
-            if (typeof loadAccidentHistory === "function") {
-                await loadAccidentHistory();
+            if (!password || !reason) {
+                modalStatus.textContent = 'Ingrese la contraseña y el motivo.';
+                modalStatus.className = 'mt-4 text-center text-sm font-semibold text-yellow-400';
+                return;
             }
 
-            
-            // Opcional: Cerrar el modal después de un breve retraso
-            setTimeout(() => {
-                // Aquí deberías tener código para cerrar el modal
-                // Ejemplo: $('#resetModal').modal('hide');
-            }, 3000);
+            try {
+                const response = await fetch(`${RASPBERRY_API_URL}/api/reset_accident_counter`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password, reason })
+                });
 
-        } else {
-            // Fallo: Código 401 (Unauthorized) o 500 (Server Error)
-            const errorMessage = result.message || result.error || 'Error desconocido al reiniciar.';
-            modalStatus.textContent = `❌ Error: ${errorMessage}`;
-            modalStatus.className = 'mt-4 text-center text-sm font-semibold text-red-500';
+                const result = await response.json();
 
-            // Si es 401, el mensaje será "Contraseña de administrador incorrecta."
-            if (response.status === 401) {
-                document.getElementById('admin-password-input').value = ''; // Limpia la contraseña
+                if (response.ok && result.ok) {
+                    modalStatus.textContent = `✅ Contador Reiniciado.`;
+                    modalStatus.className = 'mt-4 text-center text-sm font-semibold text-green-400';
+                    getSafetyStatus();
+                    getAccidentHistory();
+                    setTimeout(hideResetModal, 2000);
+                } else {
+                    modalStatus.textContent = `❌ ${result.message || result.error}`;
+                    modalStatus.className = 'mt-4 text-center text-sm font-semibold text-red-500';
+                }
+            } catch (error) {
+                modalStatus.textContent = `❌ Error de conexión.`;
+                modalStatus.className = 'mt-4 text-center text-sm font-semibold text-red-500';
             }
         }
-
-    } catch (error) {
-        // 4. Manejo de errores de red o JSON inválido
-        console.error('Fetch error:', error);
-        modalStatus.textContent = `❌ Error de conexión: No se pudo contactar al servidor.`;
-        modalStatus.className = 'mt-4 text-center text-sm font-semibold text-red-500';
-    }
-}
-
-        // --- FUNCIONES DE REPORTES (IMPLEMENTADAS) ---
 
         let realTimeChart = null;
         let hourlyChart = null;
@@ -479,17 +562,20 @@
             }
         }
 
-        // --- FUNCIONES CORREGIDAS PARA CHARTS (usar objetos {x,y}) ---
-
         async function initRealTimeChart() {
             const ctx = document.getElementById('realTimeChart')?.getContext('2d');
             if (!ctx) return;
 
             try {
-                const response = await fetch('/api/measurements?mode=latest');
-                const data = await response.json();
-
-                const chartData = (Array.isArray(data) ? data : []).map(d => ({ x: d.ts, y: d.value * 1.034 }));
+                const fluxQuery = `
+                    from(bucket: "${INFLUX_BUCKET}")
+                        |> range(start: -1h)
+                        |> filter(fn: (r) => r["_measurement"] == "cfw500_telemetry")
+                        |> filter(fn: (r) => r["_field"] == "freq_hz")
+                        |> yield(name: "last")
+                `;
+                const data = await queryInflux(fluxQuery);
+                const chartData = data.map(d => ({ x: d.ts, y: d.value }));
 
                 if (realTimeChart) realTimeChart.destroy();
 
@@ -497,7 +583,7 @@
                     type: 'line',
                     data: {
                         datasets: [{
-                            label: 'Frecuencia (Un_Hs)',
+                            label: 'Frecuencia (Hz)',
                             data: chartData,
                             borderColor: '#f18f01',
                             backgroundColor: 'rgba(241, 143, 1, 0.2)',
@@ -512,13 +598,13 @@
                         scales: {
                             x: {
                                 type: 'time',
-                                time: { unit: 'second', tooltipFormat: 'YYYY-MM-DD HH:mm:ss' },
+                                time: { unit: 'minute', tooltipFormat: 'YYYY-MM-DD HH:mm:ss' },
                                 title: { display: true, text: 'Tiempo', color: '#c6c8d6' },
                                 ticks: { color: '#c6c8d6' },
                                 grid: { color: 'rgba(255, 255, 255, 0.1)' }
                             },
                             y: {
-                                title: { display: true, text: 'Frecuencia (Un_Hs)', color: '#c6c8d6' },
+                                title: { display: true, text: 'Frecuencia (Hz)', color: '#c6c8d6' },
                                 ticks: { color: '#c6c8d6' },
                                 grid: { color: 'rgba(255, 255, 255, 0.1)' },
                                 min: 0,
@@ -528,20 +614,14 @@
                         plugins: {
                             legend: { labels: { color: '#c6c8d6' } },
                             zoom: {
-                                pan: { enabled: true, mode: 'x', modifierKey: 'shift' },
-                                zoom: {
-                                    wheel: { enabled: true },
-                                    pinch: { enabled: true },
-                                    mode: 'x',
-                                }
+                                pan: { enabled: true, mode: 'x' },
+                                zoom: { wheel: { enabled: true }, mode: 'x' }
                             }
                         }
                     }
                 });
-
             } catch (error) {
-                console.error('Error cargando gráfico tiempo real:', error);
-                if (ctx && ctx.parentElement) ctx.parentElement.innerHTML = '<p class="text-red-500 p-4">Error cargando datos de tiempo real.</p>';
+                console.error('Error cargando datos de InfluxDB Cloud:', error);
             }
         }
 
@@ -550,10 +630,16 @@
             if (!ctx) return;
             
             try {
-                const response = await fetch('/api/measurements?mode=hourly');
-                const data = await response.json();
-
-                const chartData = (Array.isArray(data) ? data : []).map(d => ({ x: d.ts, y: d.value * 1.034 }));
+                const fluxQuery = `
+                    from(bucket: "${INFLUX_BUCKET}")
+                        |> range(start: -24h)
+                        |> filter(fn: (r) => r["_measurement"] == "cfw500_telemetry")
+                        |> filter(fn: (r) => r["_field"] == "freq_hz")
+                        |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+                        |> yield(name: "hourly_mean")
+                `;
+                const data = await queryInflux(fluxQuery);
+                const chartData = data.map(d => ({ x: d.ts, y: d.value }));
 
                 if (hourlyChart) hourlyChart.destroy();
 
@@ -561,7 +647,7 @@
                     type: 'bar',
                     data: {
                         datasets: [{
-                            label: 'Unidad Promedio (24HS)',
+                            label: 'Promedio Por Hora (24h)',
                             data: chartData,
                             backgroundColor: '#45e545',
                             borderColor: '#45e545',
@@ -580,22 +666,18 @@
                                 grid: { color: 'rgba(255, 255, 255, 0.1)' }
                             },
                             y: {
-                                title: { display: true, text: 'Frecuencia Promedio (Un_Hs)', color: '#c6c8d6' },
+                                title: { display: true, text: 'Promedio Hz', color: '#c6c8d6' },
                                 ticks: { color: '#c6c8d6' },
                                 grid: { color: 'rgba(255, 255, 255, 0.1)' },
                                 min: 0,
                                 max: 60
                             }
                         },
-                        plugins: {
-                            legend: { labels: { color: '#c6c8d6' } }
-                        }
+                        plugins: { legend: { labels: { color: '#c6c8d6' } } }
                     }
                 });
-
             } catch (error) {
-                console.error('Error cargando gráfico por hora:', error);
-                if (ctx && ctx.parentElement) ctx.parentElement.innerHTML = '<p class="text-red-500 p-4">Error cargando datos por hora.</p>';
+                console.error('Error cargando gráfico hourly de InfluxDB Cloud:', error);
             }
         }
 
@@ -604,10 +686,16 @@
             if (!ctx) return;
             
             try {
-                const response = await fetch('/api/measurements?mode=monthly');
-                const data = await response.json();
-
-                const chartData = (Array.isArray(data) ? data : []).map(d => ({ x: d.ts, y: d.value * 1.034 }));
+                const fluxQuery = `
+                    from(bucket: "${INFLUX_BUCKET}")
+                        |> range(start: -30d)
+                        |> filter(fn: (r) => r["_measurement"] == "cfw500_telemetry")
+                        |> filter(fn: (r) => r["_field"] == "freq_hz")
+                        |> aggregateWindow(every: 1d, fn: mean, createEmpty: false)
+                        |> yield(name: "daily_mean")
+                `;
+                const data = await queryInflux(fluxQuery);
+                const chartData = data.map(d => ({ x: d.ts, y: d.value }));
 
                 if (monthlyChart) monthlyChart.destroy();
 
@@ -615,7 +703,7 @@
                     type: 'line',
                     data: {
                         datasets: [{
-                            label: 'Unidad promedio (MENSUAL)',
+                            label: 'Promedio Diario (30 Días)',
                             data: chartData,
                             borderColor: '#ffa500',
                             backgroundColor: 'rgba(255,165,0,0.2)',
@@ -636,7 +724,7 @@
                                 grid: { color: 'rgba(255,255,255,0.1)' }
                             },
                             y: {
-                                title: { display: true, text: 'Promedio diario (Un/Dia)', color: '#c6c8d6' },
+                                title: { display: true, text: 'Promedio Hz', color: '#c6c8d6' },
                                 ticks: { color: '#c6c8d6' },
                                 grid: { color: 'rgba(255,255,255,0.1)' },
                                 min: 0,
@@ -648,27 +736,29 @@
                 });
             } catch (error) {
                 console.error('Error cargando gráfico mensual:', error);
-                if (ctx && ctx.parentElement) ctx.parentElement.innerHTML = '<p class="text-red-500 p-4">Error cargando datos mensuales.</p>';
             }
         }
-
-        // --- FUNCIONES DE HISTORIAL (IMPLEMENTADAS) ---
 
         async function getFrequencyHistory() {
             const listEl = document.getElementById('frequency-history-list');
             const statusEl = document.getElementById('history-loading-status');
             if (!listEl) return;
 
-            if (statusEl) statusEl.textContent = 'Cargando últimos 500 registros...';
-            listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">Cargando...</td></tr>';
+            if (statusEl) statusEl.textContent = 'Cargando datos desde InfluxDB Cloud...';
             
             try {
-                const response = await fetch('/api/measurements?mode=latest');
-                const data = await response.json();
+                const fluxQuery = `
+                    from(bucket: "${INFLUX_BUCKET}")
+                        |> range(start: -24h)
+                        |> filter(fn: (r) => r["_measurement"] == "cfw500_telemetry")
+                        |> filter(fn: (r) => r["_field"] == "freq_hz")
+                        |> limit(n: 500)
+                `;
+                const data = await queryInflux(fluxQuery);
                 
-                listEl.innerHTML = ''; // Limpiar
+                listEl.innerHTML = '';
                 if (!data || data.length === 0) {
-                    listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">No hay datos de frecuencia recientes.</td></tr>';
+                    listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">No hay datos recientes en InfluxDB Cloud.</td></tr>';
                     if (statusEl) statusEl.textContent = 'Carga completa.';
                     return;
                 }
@@ -678,45 +768,22 @@
                     const row = `
                         <tr class="hover:bg-[#3a3f51]">
                             <td class="px-6 py-2 whitespace-nowrap text-sm font-medium text-gray-300">${timestamp}</td>
-                            <td class="px-6 py-2 whitespace-nowrap text-sm text-gray-400">${(item.value ?? 0).toFixed(2)} Hz</td>
+                            <td class="px-6 py-2 whitespace-nowrap text-sm text-gray-400">${item.value.toFixed(2)} Hz</td>
                         </tr>
                     `;
                     listEl.innerHTML += row;
                 });
-                if (statusEl) statusEl.textContent = `Carga completa. Mostrando ${data.length} registros.`;
+                if (statusEl) statusEl.textContent = `Mostrando ${data.length} registros desde InfluxDB.`;
                 
             } catch (error) {
-                console.error('Error fetching frequency history:', error);
-                listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-red-500">Error cargando historial de frecuencia.</td></tr>';
+                listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-red-500">Error cargando historial desde InfluxDB Cloud.</td></tr>';
                 if (statusEl) statusEl.textContent = 'Error al cargar datos.';
             }
         }
-
-        function exportFrequencyHistoryByRange() {
-            const startDate = document.getElementById('start-date-input').value;
-            const endDate = document.getElementById('end-date-input').value;
-            
-            if (!startDate || !endDate) {
-                alert('Debe seleccionar tanto la Fecha de Inicio como la Fecha de Fin.');
-                return;
-            }
-
-            const url = `/history_csv?start_date=${startDate}&end_date=${endDate}`;
-            window.location.href = url;
-        }
-
-        function exportAllFrequencyHistoryToCSV() {
-            const url = `/history_csv`;
-            window.location.href = url;
-        }
-        
-        // --- INICIALIZACIÓN --
         
         document.addEventListener('DOMContentLoaded', () => {
-            // Inicializar la página en 'main'
             window.loadPage('main');
         });
-
     </script>
 </body>
 </html>
