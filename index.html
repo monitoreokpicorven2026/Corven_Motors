@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-    <title>Monitor CFW500 - FAD (Solo Lectura)</title>
+    <title>Control CFW500 - FAD MECATRONICA</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/moment@2.30.1/moment.min.js"></script>
@@ -61,7 +61,10 @@
 
     <div class="flex flex-col lg:flex-row min-h-screen">
         <aside class="sidebar lg:w-64 p-6 flex flex-col gap-6 lg:h-auto h-20">
-            <div class="text-2xl font-bold text-white lg:mb-8 hidden lg:block">FAD</div>
+            <div class="hidden lg:block lg:mb-8">
+    <div class="text-2xl font-bold text-white">FAD MECATRONICA</div>
+    <div class="text-sm text-gray-400 font-medium">Control Industrial</div>
+</div>
             <nav class="flex lg:flex-col space-x-4 lg:space-x-0 lg:space-y-3 font-semibold text-gray-400">
                 <a id="nav-main" class="menu-item active" onclick="loadPage('main')">
                     <span>Principal</span>
@@ -72,6 +75,9 @@
                 <a id="nav-history" class="menu-item" onclick="loadPage('history')">
                     <span>Historial de Frecuencia</span>
                 </a>
+                <a id="nav-schedule" class="menu-item" onclick="loadPage('schedule')">
+                    <span>📅 Planificación</span>
+                </a>
             </nav>
         </aside>
 
@@ -80,185 +86,114 @@
     </div>
 
     <script>
-        // ======================================================================
-        // INFLUXDB CLOUD — se consulta directo desde el navegador, sin pasar
-        // por la Raspberry. Mismo mecanismo que ya usás en tus otros paneles.
-        //
-        // Completá estos 4 datos desde tu cuenta de InfluxDB Cloud
-        // (Load Data > API Tokens / Buckets):
-        // ======================================================================
-        const INFLUX_URL   = 'https://us-east.aws.cloud2.influxdata.com'; // sin barra final
-        const INFLUX_ORG   = 'Corven';
-        const INFLUX_BUCKET = 'cfw500_monitoring';
-        const INFLUX_TOKEN = 'AkKQfnvQhJSbsOEdd8rYJZwKUIQEbUtFlpJgduCbMG7GkAELHK5l766WqQOP38FB0u3s5RuRfrUNHYelwkI9_A==';
+        // =====================================================================
+        // CONFIGURACIÓN (pública, pensada para GitHub Pages)
+        // =====================================================================
+        // URL pública del backend Flask (Raspberry Pi / servidor), usada solo
+        // para lo que Influx no guarda (estado en vivo, historial de seguridad,
+        // agenda de planificación y descargas de CSV). Configurar CORS_ORIGINS
+        // en el backend con la URL de este sitio de GitHub Pages.
+        const API_BASE_URL = 'https://TU-BACKEND-URL.com'; // <-- reemplazar por la URL real del servidor Flask
 
-        // Tienen que coincidir con lo que escribe el script de la Raspberry
-        // (influx_store.py: INFLUX_MEASUREMENT / INFLUX_DEVICE).
-        const INFLUX_MEASUREMENT = 'cfw500';
-        const INFLUX_DEVICE = 'vdf-1';
+        // Config de InfluxDB Cloud: usada para leer directamente los gráficos e
+        // historial de frecuencia sin pasar por el backend.
+        // ⚠️ IMPORTANTE: este archivo es público en GitHub. NO pongas acá el
+        // token con permisos de escritura que usa el backend (CorvenCFW500p.py).
+        // Generá en InfluxDB Cloud un token nuevo, de SOLO LECTURA y con acceso
+        // únicamente al bucket "cfw500_monitoring", y pegalo abajo.
+        const INFLUX_CONFIG = {
+            url: 'https://us-east-1-1.aws.cloud2.influxdata.com',
+            org: 'Corven',
+            bucket: 'cfw500_monitoring',
+            measurement: 'cfw500',
+            device: 'cfw500_01',
+            tz: 'America/Argentina/Cordoba',
+            token: 'PEGÁ_ACÁ_TU_TOKEN_DE_SOLO_LECTURA' // <-- reemplazar
+        };
 
-        // Banda de alerta solo para pintar el panel de este HTML público.
-        // Es una copia de MIN_FREQ_ALERT/MAX_FREQ_ALERT del backend: si cambiás
-        // la banda desde el panel local, actualizá también estos dos números.
-        const BAND_MIN = 5.0;
-        const BAND_MAX = 46.0;
-
-        // ---- Aviso de "sin datos" (falla de red, token vencido, CORS, etc.) ----
-        function setBackendOffline(isOffline, detail) {
-            let el = document.getElementById('backend-offline-banner');
-            if (!el) {
-                el = document.createElement('div');
-                el.id = 'backend-offline-banner';
-                el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;' +
-                    'background:#b91c1c;color:#fff;padding:8px 12px;text-align:center;' +
-                    'font-size:14px;font-family:sans-serif;display:none';
-                document.body.appendChild(el);
-            }
-            if (isOffline) {
-                el.textContent = 'No se pudo leer InfluxDB' + (detail ? ' (' + detail + ')' : '') +
-                    '. Los datos mostrados pueden estar desactualizados.';
-                el.style.display = 'block';
-            } else {
-                el.style.display = 'none';
-            }
-        }
-
-        // ---- Cliente Flux mínimo (POST + parseo de "annotated CSV") ----
-        async function fluxQuery(fluxBody) {
-            let resp;
-            try {
-                resp = await fetch(`${INFLUX_URL}/api/v2/query?org=${encodeURIComponent(INFLUX_ORG)}`, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Token ${INFLUX_TOKEN}`,
-                        'Content-Type': 'application/vnd.flux',
-                        'Accept': 'application/csv'
-                    },
-                    body: fluxBody
-                });
-            } catch (e) {
-                // Esto salta por red caída, o por CORS si Influx Cloud no lo habilita
-                // para este origen (poco común, pero puede pasar según el plan).
-                setBackendOffline(true, 'red o CORS');
-                throw e;
-            }
+        // Ejecuta una consulta Flux contra InfluxDB Cloud y devuelve
+        // [{ts, value}, ...] ordenado ascendente por tiempo.
+        async function influxQuery(flux) {
+            const resp = await fetch(`${INFLUX_CONFIG.url}/api/v2/query?org=${encodeURIComponent(INFLUX_CONFIG.org)}`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Token ${INFLUX_CONFIG.token}`,
+                    'Content-Type': 'application/vnd.flux',
+                    'Accept': 'application/csv'
+                },
+                body: flux
+            });
             if (!resp.ok) {
-                const text = await resp.text().catch(() => '');
-                setBackendOffline(true, `HTTP ${resp.status}`);
-                throw new Error(`Influx query error ${resp.status}: ${text.slice(0, 200)}`);
+                throw new Error(`InfluxDB respondió ${resp.status}`);
             }
-            setBackendOffline(false);
-            return parseAnnotatedCSV(await resp.text());
+            const csv = await resp.text();
+            return parseFluxCSV(csv);
         }
 
-        // Parsea el formato "annotated CSV" que devuelve /api/v2/query.
-        // Devuelve [{ts: "2026-01-01T00:00:10", value: 49.5}, ...]
-        function parseAnnotatedCSV(text) {
-            const rows = [];
-            let timeIdx = -1, valueIdx = -1;
-            for (const rawLine of text.split('\n')) {
-                const line = rawLine.replace(/\r$/, '');
-                if (!line || line.startsWith('#')) continue;
-                const cols = line.split(',');
-                if (cols[0] === '' && cols[1] === 'result') {
-                    // Línea de encabezado (puede repetirse si hay varias tablas)
-                    timeIdx = cols.indexOf('_time');
-                    valueIdx = cols.indexOf('_value');
-                    continue;
-                }
-                if (timeIdx === -1 || valueIdx === -1) continue;
+        // Parser mínimo del "annotated CSV" que devuelve la API de Flux.
+        function parseFluxCSV(csv) {
+            const lines = csv.split('\n').filter(l => l.length && !l.startsWith('#'));
+            if (lines.length < 2) return [];
+            const header = lines[0].split(',');
+            const timeIdx = header.indexOf('_time');
+            const valueIdx = header.indexOf('_value');
+            if (timeIdx === -1 || valueIdx === -1) return [];
+            const out = [];
+            for (let i = 1; i < lines.length; i++) {
+                const cols = lines[i].split(',');
                 if (cols.length <= Math.max(timeIdx, valueIdx)) continue;
-                const v = parseFloat(cols[valueIdx]);
-                if (Number.isNaN(v)) continue;
-                // "2026-01-01T00:00:10Z" -> quitamos la Z para que el resto del
-                // código (Chart.js, moment, etc.) lo trate como hora local, igual
-                // que antes con los timestamps que venían de SQLite.
-                const ts = cols[timeIdx].replace('Z', '');
-                rows.push({ ts, value: v });
+                const value = parseFloat(cols[valueIdx]);
+                if (isNaN(value)) continue;
+                out.push({ ts: cols[timeIdx], value });
             }
-            return rows;
+            out.sort((a, b) => a.ts.localeCompare(b.ts));
+            return out;
         }
 
-        const fluxFilter = `r._measurement == "${INFLUX_MEASUREMENT}" and r.device == "${INFLUX_DEVICE}"`;
+        const FLUX_HEADER = `import "timezone"\noption location = timezone.location(name: "${INFLUX_CONFIG.tz}")\n`;
 
-        // Últimas N muestras crudas
-        async function influxLatest(field = 'freq_hz', limit = 500, lookback = '7d') {
-            return fluxQuery(`
-from(bucket: "${INFLUX_BUCKET}")
-  |> range(start: -${lookback})
-  |> filter(fn: (r) => ${fluxFilter})
-  |> filter(fn: (r) => r._field == "${field}")
-  |> keep(columns: ["_time", "_value"])
-  |> tail(n: ${limit})`);
+        function fluxFilter(field) {
+            return `  |> filter(fn: (r) => r._measurement == "${INFLUX_CONFIG.measurement}")\n  |> filter(fn: (r) => r._field == "${field}")\n`;
         }
 
-        // Promedio por hora, últimas N horas
-        async function influxHourly(field = 'freq_hz', hours = 24) {
-            return fluxQuery(`
-from(bucket: "${INFLUX_BUCKET}")
-  |> range(start: -${hours}h)
-  |> filter(fn: (r) => ${fluxFilter})
-  |> filter(fn: (r) => r._field == "${field}")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
-  |> keep(columns: ["_time", "_value"])`);
+        // Últimas N muestras crudas (equivalente a mode=latest del backend).
+        function getInfluxLatest(field = 'freq_hz', limit = 500, lookback = '24h') {
+            const flux = `from(bucket: "${INFLUX_CONFIG.bucket}")\n  |> range(start: -${lookback})\n` +
+                fluxFilter(field) +
+                `  |> keep(columns: ["_time", "_value"])\n  |> tail(n: ${limit})\n`;
+            return influxQuery(flux);
         }
 
-        // Promedio por día, últimos N días
-        async function influxDaily(field = 'freq_hz', days = 30) {
-            return fluxQuery(`
-from(bucket: "${INFLUX_BUCKET}")
-  |> range(start: -${days}d)
-  |> filter(fn: (r) => ${fluxFilter})
-  |> filter(fn: (r) => r._field == "${field}")
-  |> aggregateWindow(every: 1d, fn: mean, createEmpty: false)
-  |> keep(columns: ["_time", "_value"])`);
+        // Promedio por hora de las últimas N horas (mode=hourly).
+        function getInfluxHourly(field = 'freq_hz', hours = 24) {
+            const flux = FLUX_HEADER +
+                `from(bucket: "${INFLUX_CONFIG.bucket}")\n  |> range(start: -${hours}h)\n` +
+                fluxFilter(field) +
+                `  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)\n  |> keep(columns: ["_time", "_value"])\n`;
+            return influxQuery(flux);
         }
 
-        // Rango de fechas puntual, para los CSV de descarga
-        async function influxRange(startDate, endDate, field = 'freq_hz') {
-            return fluxQuery(`
-from(bucket: "${INFLUX_BUCKET}")
-  |> range(start: ${startDate}T00:00:00Z, stop: ${endDate}T23:59:59Z)
-  |> filter(fn: (r) => ${fluxFilter})
-  |> filter(fn: (r) => r._field == "${field}")
-  |> keep(columns: ["_time", "_value"])
-  |> sort(columns: ["_time"])`);
+        // Promedio por día de los últimos N días (mode=monthly).
+        function getInfluxDaily(field = 'freq_hz', days = 30) {
+            const flux = FLUX_HEADER +
+                `from(bucket: "${INFLUX_CONFIG.bucket}")\n  |> range(start: -${days}d)\n` +
+                fluxFilter(field) +
+                `  |> aggregateWindow(every: 1d, fn: mean, createEmpty: false)\n  |> keep(columns: ["_time", "_value"])\n`;
+            return influxQuery(flux);
         }
 
-        // Último valor de un campo (para "Frecuencia actual", "Referencia", etc.)
-        async function influxLastValue(field = 'freq_hz') {
-            const rows = await fluxQuery(`
-from(bucket: "${INFLUX_BUCKET}")
-  |> range(start: -7d)
-  |> filter(fn: (r) => ${fluxFilter})
-  |> filter(fn: (r) => r._field == "${field}")
-  |> last()
-  |> keep(columns: ["_time", "_value"])`);
-            return rows.length ? rows[rows.length - 1] : null;
+        // Muestras crudas desde la medianoche local (mode=today, para el gráfico en tiempo real).
+        function getInfluxToday(field = 'freq_hz') {
+            const now = new Date();
+            const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            const startIso = midnight.toISOString();
+            const flux = `from(bucket: "${INFLUX_CONFIG.bucket}")\n  |> range(start: ${startIso})\n` +
+                fluxFilter(field) +
+                `  |> keep(columns: ["_time", "_value"])\n  |> sort(columns: ["_time"])\n`;
+            return influxQuery(flux);
         }
 
-        // Descarga un array [{ts,value}] como CSV, sin pasar por ningún backend
-        function downloadRowsAsCSV(rows, filename, header = 'Fecha,Hora,Un_Hs') {
-            const lines = [header];
-            for (const r of rows) {
-                const dt = new Date(r.ts.endsWith('Z') ? r.ts : r.ts + 'Z');
-                const fecha = dt.toLocaleDateString('es-AR');
-                const hora = dt.toLocaleTimeString('es-AR', { hour12: false });
-                lines.push(`${fecha},${hora},${r.value}`);
-            }
-            const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            URL.revokeObjectURL(url);
-        }
-
-
-        // La modificación de frecuencia/banda queda exclusivamente en la página LOCAL (LAN/Tailscale).
+        // Contenido del panel de control (solo lectura: sin formularios de escritura)
         const newControlPanelHTML = `
             <div id="band-alert-banner" class="hidden alert-pulse p-4 rounded-lg mb-4 text-center font-bold text-white shadow-xl">
                 ⚠️ ¡ALERTA! FRECUENCIA DE REFERENCIA FUERA DE BANDA ⚠️
@@ -266,12 +201,9 @@ from(bucket: "${INFLUX_BUCKET}")
 
             <hr class="my-4 border-gray-600">
 
-            <div class="flex justify-between items-center text-sm text-gray-300 bg-[#2c2f3a] p-3 rounded">
-                <span>Banda de Alerta configurada:</span>
-                <span id="current-band-limits" class="font-mono text-gray-200">-- Hz</span>
-            </div>
-            <p class="mt-3 text-xs text-center text-gray-500">
-                Esta es una vista de solo lectura. La modificación de parámetros solo está disponible desde la red local.
+            <p class="flex justify-between items-center text-lg">
+                <span class="text-yellow-300 font-semibold">Banda de Alerta Configurada:</span>
+                <span id="current-band-limits" class="font-mono text-lg">-- Hz</span>
             </p>
         `;
 
@@ -328,7 +260,6 @@ from(bucket: "${INFLUX_BUCKET}")
                     <p id="accident-history-status" class="mt-4 text-sm text-center text-gray-400"></p>
                 </div>
             </div>
-
         `;
 
         // 2. Contenido de la página REPORTES (Gráficos)
@@ -337,10 +268,10 @@ from(bucket: "${INFLUX_BUCKET}")
                 <h1 class="text-3xl font-bold mb-6 text-white">Reportes de Frecuencia y Seguridad</h1>
                 
                 <div class="card p-4 rounded-lg mb-6">
-                    <h2 class="text-xl font-semibold mb-2 text-[#45e545]">Frecuencia en Tiempo Real (Un_Hs)</h2>
+                    <h2 class="text-xl font-semibold mb-2 text-[#45e545]">Frecuencia del Día Actual (Un_Hs)</h2>
                     
                     <div class="flex justify-between items-center mb-4"> 
-                        <p class="text-sm text-gray-400">Muestra la frecuencia completa. Usa el zoom (rueda del ratón) y desplazamiento (clic y arrastrar) para explorar.</p>
+                        <p class="text-sm text-gray-400">Registros de hoy desde las 00:00. Usá la rueda del mouse para hacer zoom, clic y arrastrar para desplazar.</p>
                         <button onclick="resetZoom()" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-1 px-3 rounded text-sm transition duration-200 flex items-center gap-1">
                             Reiniciar Zoom
                         </button>
@@ -420,39 +351,38 @@ from(bucket: "${INFLUX_BUCKET}")
 
         // --- FUNCIONES Y LÓGICA DE CONTROL ---
 
-        // Función de polling para actualizar el estado (lee último valor de Influx)
+        // Función de polling para actualizar el estado
         async function updateStatus() {
             try {
-                const [freqRow, targetRow] = await Promise.all([
-                    influxLastValue('freq_hz'),
-                    influxLastValue('target_freq_hz')
-                ]);
+                const response = await fetch(`${API_BASE_URL}/status`);
+                const data = await response.json();
 
-                const actualEl = document.getElementById('actual-freq');
-                const targetEl = document.getElementById('target-freq');
-                const measured = freqRow ? freqRow.value : null;
-                const ref = targetRow ? targetRow.value : null;
+                if (data.ok) {
+                    const actualEl = document.getElementById('actual-freq');
+                    const targetEl = document.getElementById('target-freq');
+                    const Un_Hs = (data.measured_freq).toFixed(2);
+                    if (actualEl) actualEl.textContent = `${Un_Hs} Un_Hs`;
 
-                if (actualEl) actualEl.textContent = measured !== null ? `${measured.toFixed(2)} Un_Hs` : '-- Hz';
-                if (targetEl) targetEl.textContent = ref !== null ? `${ref.toFixed(2)} Hz` : '-- Hz';
+                    if (targetEl) targetEl.textContent = `${data.ref_freq.toFixed(2)} Hz`;
 
-                // Banda de alerta: constante local (ver BAND_MIN/BAND_MAX arriba),
-                // no viene de la Raspberry en este panel público.
-                const currentBandLimits = document.getElementById('current-band-limits');
-                if (currentBandLimits) {
-                    currentBandLimits.textContent = `${BAND_MIN.toFixed(2)} - ${BAND_MAX.toFixed(2)} Hz`;
-                }
+                    
+                    // Actualizar límites de banda en el panel de control
+                    const currentBandLimits = document.getElementById('current-band-limits');
+                    if (currentBandLimits) {
+                        currentBandLimits.textContent = `${data.min_band.toFixed(2)} - ${data.max_band.toFixed(2)} Hz`;
+                    }
 
-                const alertActive = measured !== null && (measured < BAND_MIN || measured > BAND_MAX);
-                const alertBanner = document.getElementById('band-alert-banner');
-                const paramsCard = document.getElementById('params-card');
+                    // Lógica de alerta visual (Banner rojo)
+                    const alertBanner = document.getElementById('band-alert-banner');
+                    const paramsCard = document.getElementById('params-card');
 
-                if (alertActive) {
-                    if (alertBanner) alertBanner.classList.remove('hidden');
-                    if (paramsCard) paramsCard.classList.add('border-4', 'border-red-700');
-                } else {
-                    if (alertBanner) alertBanner.classList.add('hidden');
-                    if (paramsCard) paramsCard.classList.remove('border-4', 'border-red-700');
+                    if (data.alert_active) {
+                        if (alertBanner) alertBanner.classList.remove('hidden');
+                        if (paramsCard) paramsCard.classList.add('border-4', 'border-red-700');
+                    } else {
+                        if (alertBanner) alertBanner.classList.add('hidden');
+                        if (paramsCard) paramsCard.classList.remove('border-4', 'border-red-700');
+                    }
                 }
             } catch (error) {
                 console.error('Error fetching status:', error);
@@ -460,12 +390,7 @@ from(bucket: "${INFLUX_BUCKET}")
         }
 
         // Función de inicialización de la página 'main'
-        // (Sin listeners de escritura: esta página es solo lectura)
         function setupMainPage() {
-            
-            const bandForm = document.getElementById('set-band-form');
-            if (bandForm) bandForm.addEventListener('submit', setBandLimits);
-
             // Iniciar la actualización de estado y el polling
             updateStatus(); 
             if (!window.statusInterval) { // Prevenir múltiples intervalos
@@ -495,6 +420,9 @@ from(bucket: "${INFLUX_BUCKET}")
             } else if (page === 'history') {
                 contentEl.innerHTML = historyContentHTML;
                 getFrequencyHistory(); 
+            } else if (page === 'schedule') {
+                contentEl.innerHTML = scheduleContentHTML;
+                setupSchedulePage();
             }
 
             // Actualizar clases de navegación
@@ -513,75 +441,51 @@ from(bucket: "${INFLUX_BUCKET}")
 
         // --- FUNCIONES DE SEGURIDAD (IMPLEMENTADAS) ---
 
-        // Días sin accidentes, historial de reinicios y reset de contador son
-        // datos relacionales (SQLite en la Raspberry), no series temporales, así
-        // que no salen de InfluxDB. Dejá REMOTE_API_BASE vacío si por ahora solo
-        // querés los gráficos de frecuencia (esta sección se muestra como "no
-        // disponible"). Si más adelante exponés el Flask por HTTPS (Tailscale
-        // Funnel, Cloudflare Tunnel, etc.), completá la URL acá y se activa sola.
-        const REMOTE_API_BASE = ''; // ej: 'https://rpi-planta.tailXXXX.ts.net'
-
-        async function remoteFetch(path, options) {
-            if (!REMOTE_API_BASE) return null; // sección deshabilitada a propósito
-            return fetch(REMOTE_API_BASE + path, options);
-        }
-
         async function getSafetyStatus() {
-            const safetyEl = document.getElementById('safety-status');
-            const lastEl   = document.getElementById('last-accident-ts');
             try {
-                // Lee el último evento de seguridad desde Influx Cloud
-                const rows = await fluxQuery(`
-from(bucket: "${INFLUX_BUCKET}")
-  |> range(start: -3650d)
-  |> filter(fn: (r) => r._measurement == "safety_events" and r.device == "${INFLUX_DEVICE}")
-  |> filter(fn: (r) => r._field == "reason")
-  |> last()
-  |> keep(columns: ["_time", "_value"])`);
+                const response = await fetch(`${API_BASE_URL}/api/time_since_accident`);
+                const data = await response.json();
 
-                if (!rows || rows.length === 0) {
-                    if (safetyEl) safetyEl.textContent = 'Sin datos aún';
-                    if (lastEl)   lastEl.textContent   = '';
-                    return;
-                }
-                const last = rows[rows.length - 1];
-                const lastDt = new Date(last.ts.endsWith('Z') ? last.ts : last.ts + 'Z');
-                const days = Math.floor((Date.now() - lastDt.getTime()) / 86400000);
+                // manejar varios posibles nombres de campos que pueda enviar el backend
+                const days = (data && (data.days_since ?? data.daysSince ?? data.days)) ?? '--';
+                const lastTs = (data && (data.last_ts || data.last_accident_ts || data.lastAccidentTs)) || '--';
+                
+                const safetyEl = document.getElementById('safety-status');
+                const lastEl = document.getElementById('last-accident-ts');
                 if (safetyEl) safetyEl.textContent = `${days} días`;
-                if (lastEl)   lastEl.textContent   = `Último reinicio: ${lastDt.toLocaleString('es-AR')}`;
+                if (lastEl) lastEl.textContent = `Último incidente: ${lastTs}`;
             } catch (error) {
                 console.error('Error fetching safety status:', error);
+                const safetyEl = document.getElementById('safety-status');
                 if (safetyEl) safetyEl.textContent = '--';
             }
         }
 
         async function getAccidentHistory() {
             const listEl = document.getElementById('accident-history-list');
-            if (!listEl) return;
+            if (!listEl) return; 
 
             try {
-                const rows = await fluxQuery(`
-from(bucket: "${INFLUX_BUCKET}")
-  |> range(start: -3650d)
-  |> filter(fn: (r) => r._measurement == "safety_events" and r.device == "${INFLUX_DEVICE}")
-  |> filter(fn: (r) => r._field == "reason")
-  |> sort(columns: ["_time"], desc: true)
-  |> limit(n: 50)
-  |> keep(columns: ["_time", "_value"])`);
+                const response = await fetch(`${API_BASE_URL}/api/accident_history`);
+                const history = await response.json();
 
-                listEl.innerHTML = '';
-                if (!rows || rows.length === 0) {
+                listEl.innerHTML = ''; // Limpiar
+                if (!history || history.length === 0) {
                     listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">No hay historial de reinicios.</td></tr>';
                     return;
                 }
-                rows.forEach(r => {
-                    const dt = new Date(r.ts.endsWith('Z') ? r.ts : r.ts + 'Z');
-                    listEl.innerHTML += `
+
+                history.forEach(item => {
+                    const ts = item.timestamp || item.reset_ts || item.ts || '';
+                    const row = `
                         <tr class="hover:bg-[#3a3f51]">
-                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-300">${dt.toLocaleString('es-AR')}</td>
-                            <td class="px-6 py-4 text-sm text-gray-400">${r.value}</td>
-                        </tr>`;
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-300">${ts}</td>
+                            <td class="px-6 py-4 text-sm text-gray-400">${item.reason || item.motivo || ''}</td>
+                        </tr>
+                    `;
+                    listEl.innerHTML += row;
                 });
+
             } catch (error) {
                 console.error('Error fetching accident history:', error);
                 listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-red-500">Error cargando historial.</td></tr>';
@@ -607,7 +511,8 @@ from(bucket: "${INFLUX_BUCKET}")
             if (!ctx) return;
 
             try {
-                const data = await influxLatest('freq_hz', 500, '7d');
+                const data = await getInfluxToday('freq_hz');
+
                 const chartData = (Array.isArray(data) ? data : []).map(d => ({ x: d.ts, y: d.value * 1.034 }));
 
                 if (realTimeChart) realTimeChart.destroy();
@@ -616,13 +521,14 @@ from(bucket: "${INFLUX_BUCKET}")
                     type: 'line',
                     data: {
                         datasets: [{
-                            label: 'Frecuencia (Un_Hs)',
+                            label: 'Frecuencia del día (Un_Hs)',
                             data: chartData,
                             borderColor: '#f18f01',
-                            backgroundColor: 'rgba(241, 143, 1, 0.2)',
+                            backgroundColor: 'rgba(241, 143, 1, 0.15)',
                             borderWidth: 2,
                             pointRadius: 0,
-                            tension: 0.1
+                            tension: 0.1,
+                            fill: true
                         }]
                     },
                     options: {
@@ -631,8 +537,8 @@ from(bucket: "${INFLUX_BUCKET}")
                         scales: {
                             x: {
                                 type: 'time',
-                                time: { unit: 'second', tooltipFormat: 'YYYY-MM-DD HH:mm:ss' },
-                                title: { display: true, text: 'Tiempo', color: '#c6c8d6' },
+                                time: { unit: 'hour', tooltipFormat: 'HH:mm:ss', displayFormats: { hour: 'HH:mm' } },
+                                title: { display: true, text: 'Hora del día', color: '#c6c8d6' },
                                 ticks: { color: '#c6c8d6' },
                                 grid: { color: 'rgba(255, 255, 255, 0.1)' }
                             },
@@ -669,7 +575,8 @@ from(bucket: "${INFLUX_BUCKET}")
             if (!ctx) return;
             
             try {
-                const data = await influxHourly('freq_hz', 24);
+                const data = await getInfluxHourly('freq_hz', 24);
+
                 const chartData = (Array.isArray(data) ? data : []).map(d => ({ x: d.ts, y: d.value * 1.034 }));
 
                 if (hourlyChart) hourlyChart.destroy();
@@ -721,7 +628,8 @@ from(bucket: "${INFLUX_BUCKET}")
             if (!ctx) return;
             
             try {
-                const data = await influxDaily('freq_hz', 30);
+                const data = await getInfluxDaily('freq_hz', 30);
+
                 const chartData = (Array.isArray(data) ? data : []).map(d => ({ x: d.ts, y: d.value * 1.034 }));
 
                 if (monthlyChart) monthlyChart.destroy();
@@ -778,8 +686,8 @@ from(bucket: "${INFLUX_BUCKET}")
             listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">Cargando...</td></tr>';
             
             try {
-                const data = await influxLatest('freq_hz', 500, '7d');
-
+                const data = await getInfluxLatest('freq_hz', 500);
+                
                 listEl.innerHTML = ''; // Limpiar
                 if (!data || data.length === 0) {
                     listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">No hay datos de frecuencia recientes.</td></tr>';
@@ -815,25 +723,265 @@ from(bucket: "${INFLUX_BUCKET}")
                 return;
             }
 
-            try {
-                const rows = await influxRange(startDate, endDate, 'freq_hz');
-                if (!rows || rows.length === 0) { alert('Sin datos para ese período.'); return; }
-                downloadRowsAsCSV(rows, `frecuencias_\${startDate}_a_\${endDate}.csv`);
-            } catch(e) { alert('Error descargando: ' + e.message); }
-            return; // no continuar con window.location.href
-
+            const url = `${API_BASE_URL}/history_csv?start_date=${startDate}&end_date=${endDate}`;
+            window.location.href = url;
         }
 
         function exportAllFrequencyHistoryToCSV() {
-            try {
-                const rows = await influxLatest('freq_hz', 50000, '365d');
-                if (!rows || rows.length === 0) { alert('Sin datos.'); return; }
-                downloadRowsAsCSV(rows, 'frecuencias_completo.csv');
-            } catch(e) { alert('Error descargando: ' + e.message); }
-            return;
-
+            const url = `${API_BASE_URL}/history_csv`;
+            window.location.href = url;
         }
         
+        // =====================================================================
+        // MÓDULO DE PLANIFICACIÓN DE PRODUCCIÓN
+        // =====================================================================
+
+        const scheduleContentHTML = `
+            <div class="content-container">
+                <h1 class="text-3xl font-bold mb-2 text-white">📅 Planificación de Producción</h1>
+                <p class="text-gray-400 mb-6 text-sm">Agenda de cambios de frecuencia programados (solo lectura).</p>
+
+                <!-- AGENDA DEL DÍA -->
+                <div class="card p-6 rounded-lg">
+                    <div class="flex justify-between items-center mb-4">
+                        <h2 class="text-xl font-semibold text-orange-400">Agenda del Día</h2>
+                        <button onclick="loadSchedule()"
+                            class="text-xs bg-gray-600 hover:bg-gray-500 text-white py-1 px-3 rounded transition">
+                            🔄 Actualizar
+                        </button>
+                    </div>
+
+                    <!-- Leyenda de estados -->
+                    <div class="flex gap-4 mb-4 text-xs text-gray-400 flex-wrap">
+                        <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-full bg-yellow-400"></span> Pendiente</span>
+                        <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-full bg-green-500"></span> Ejecutado</span>
+                        <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-full bg-gray-500"></span> Cancelado</span>
+                        <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-full bg-red-500"></span> Error</span>
+                    </div>
+
+                    <div class="overflow-x-auto rounded-lg">
+                        <table class="min-w-full divide-y divide-gray-700">
+                            <thead>
+                                <tr class="bg-[#3a3f51]">
+                                    <th class="px-4 py-3 text-left text-xs font-semibold uppercase text-orange-300">Hora</th>
+                                    <th class="px-4 py-3 text-left text-xs font-semibold uppercase text-orange-300">Frecuencia</th>
+                                    <th class="px-4 py-3 text-left text-xs font-semibold uppercase text-orange-300">Descripción</th>
+                                    <th class="px-4 py-3 text-left text-xs font-semibold uppercase text-orange-300">Estado</th>
+                                    <th class="px-4 py-3 text-left text-xs font-semibold uppercase text-orange-300">Acción</th>
+                                </tr>
+                            </thead>
+                            <tbody id="schedule-list" class="bg-[#2c2f3a] divide-y divide-gray-700">
+                                <tr><td colspan="5" class="px-4 py-6 text-center text-gray-500">Cargando agenda...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <p id="schedule-count" class="mt-3 text-xs text-gray-500 text-right"></p>
+                </div>
+            </div>
+        `;
+
+        // ---- LÓGICA DE PLANIFICACIÓN ----
+
+        let _cancelJobId = null;
+
+        function setupSchedulePage() {
+            // Setear fecha/hora mínima al momento actual
+            const dtInput = document.getElementById('sched-datetime');
+            if (dtInput) {
+                const now = new Date();
+                // Ajustar al timezone local para el input datetime-local
+                const offset = now.getTimezoneOffset() * 60000;
+                const localISO = new Date(now - offset).toISOString().slice(0, 16);
+                dtInput.min = localISO;
+                // Sugerir próxima hora redonda como valor por defecto
+                const next = new Date(now);
+                next.setMinutes(0, 0, 0);
+                next.setHours(next.getHours() + 1);
+                const nextISO = new Date(next - offset).toISOString().slice(0, 16);
+                dtInput.value = nextISO;
+            }
+            loadSchedule();
+        }
+
+        async function createSchedule() {
+            const statusEl = document.getElementById('sched-status');
+            const dt       = document.getElementById('sched-datetime')?.value;
+            const freq     = document.getElementById('sched-freq')?.value;
+            const label    = document.getElementById('sched-label')?.value || '';
+            const password = document.getElementById('sched-password')?.value || '';
+
+            // Validación local
+            if (!dt || !freq || !password) {
+                showSchedStatus('Completá todos los campos obligatorios.', 'warn');
+                return;
+            }
+            const freqNum = parseFloat(freq);
+            if (isNaN(freqNum) || freqNum < 0 || freqNum > 60) {
+                showSchedStatus('La frecuencia debe estar entre 0 y 60 Hz.', 'warn');
+                return;
+            }
+            if (new Date(dt) <= new Date()) {
+                showSchedStatus('La hora programada debe ser futura.', 'warn');
+                return;
+            }
+
+            showSchedStatus('Programando...', 'info');
+
+            try {
+                const resp = await fetch('/api/schedule', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        scheduled_ts: dt,
+                        freq_hz:      freqNum,
+                        label:        label,
+                        password:     password
+                    })
+                });
+                const data = await resp.json();
+                if (resp.ok && data.ok) {
+                    showSchedStatus('✅ ' + data.message, 'ok');
+                    document.getElementById('sched-freq').value    = '';
+                    document.getElementById('sched-label').value   = '';
+                    document.getElementById('sched-password').value = '';
+                    loadSchedule(); // Refrescar tabla
+                } else {
+                    showSchedStatus('❌ ' + (data.error || 'Error desconocido'), 'error');
+                    if (resp.status === 401) document.getElementById('sched-password').value = '';
+                }
+            } catch (e) {
+                showSchedStatus('❌ Error de conexión con el servidor.', 'error');
+            }
+        }
+
+        function showSchedStatus(msg, type) {
+            const el = document.getElementById('sched-status');
+            if (!el) return;
+            const colors = {
+                ok:    'text-green-400',
+                error: 'text-red-400',
+                warn:  'text-yellow-300',
+                info:  'text-gray-300'
+            };
+            el.textContent = msg;
+            el.className = 'mt-3 text-sm text-center ' + (colors[type] || 'text-gray-400');
+        }
+
+        async function loadSchedule() {
+            const tbody  = document.getElementById('schedule-list');
+            const countEl = document.getElementById('schedule-count');
+            if (!tbody) return;
+
+            tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-6 text-center text-gray-500">Cargando...</td></tr>';
+
+            try {
+                const resp = await fetch('/api/schedule?days=1');
+                const items = await resp.json();
+
+                if (!Array.isArray(items) || items.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-8 text-center text-gray-500">No hay cambios programados para hoy.</td></tr>';
+                    if (countEl) countEl.textContent = '';
+                    return;
+                }
+
+                tbody.innerHTML = items.map(item => {
+                    const dt = new Date(item.scheduled_ts);
+                    const timeStr = dt.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' });
+                    const dateStr = dt.toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' });
+
+                    const statusMap = {
+                        pending:   { dot: 'bg-yellow-400', text: 'Pendiente',  textColor: 'text-yellow-300' },
+                        executed:  { dot: 'bg-green-500',  text: 'Ejecutado',  textColor: 'text-green-400'  },
+                        cancelled: { dot: 'bg-gray-500',   text: 'Cancelado',  textColor: 'text-gray-400'   },
+                        error:     { dot: 'bg-red-500',    text: 'Error',       textColor: 'text-red-400'    }
+                    };
+                    const s = statusMap[item.status] || statusMap['pending'];
+
+                    const cancelBtn = item.status === 'pending'
+                        ? `<button onclick="showCancelModal(${item.id})"
+                               class="text-xs text-red-400 hover:text-red-200 border border-red-700 hover:border-red-400 py-1 px-2 rounded transition">
+                               ✕ Cancelar
+                           </button>`
+                        : `<span class="text-xs text-gray-600">—</span>`;
+
+                    const rowBg = item.status === 'pending'
+                        ? 'hover:bg-[#3a3f51]'
+                        : (item.status === 'executed' ? 'opacity-60 hover:opacity-80' : 'opacity-40');
+
+                    return `
+                        <tr class="${rowBg} transition-opacity">
+                            <td class="px-4 py-3 whitespace-nowrap">
+                                <span class="font-mono text-white text-sm">${timeStr}</span>
+                                <span class="text-gray-500 text-xs ml-1">${dateStr}</span>
+                            </td>
+                            <td class="px-4 py-3">
+                                <span class="font-mono font-bold text-orange-300 text-base">${item.freq_hz.toFixed(1)} Hz</span>
+                            </td>
+                            <td class="px-4 py-3 text-sm text-gray-300">${item.label || '<span class="text-gray-600 italic">Sin descripción</span>'}</td>
+                            <td class="px-4 py-3">
+                                <span class="flex items-center gap-2 ${s.textColor} text-sm">
+                                    <span class="inline-block w-2 h-2 rounded-full ${s.dot}"></span>
+                                    ${s.text}
+                                </span>
+                            </td>
+                            <td class="px-4 py-3">${cancelBtn}</td>
+                        </tr>
+                    `;
+                }).join('');
+
+                const pendingCount = items.filter(i => i.status === 'pending').length;
+                if (countEl) countEl.textContent = `${items.length} entradas · ${pendingCount} pendiente(s)`;
+
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-4 text-center text-red-500">Error al cargar la agenda.</td></tr>';
+            }
+        }
+
+        function showCancelModal(jobId) {
+            _cancelJobId = jobId;
+            document.getElementById('cancel-job-id').textContent = '#' + jobId;
+            document.getElementById('cancel-password').value = '';
+            document.getElementById('cancel-modal-status').textContent = '';
+            document.getElementById('cancel-modal').classList.remove('hidden');
+        }
+
+        function hideCancelModal() {
+            document.getElementById('cancel-modal').classList.add('hidden');
+            _cancelJobId = null;
+        }
+
+        async function confirmCancel() {
+            const password = document.getElementById('cancel-password')?.value || '';
+            const statusEl = document.getElementById('cancel-modal-status');
+
+            if (!password) {
+                if (statusEl) { statusEl.textContent = 'Ingresá la contraseña.'; statusEl.className = 'mt-3 text-xs text-center text-yellow-400'; }
+                return;
+            }
+            if (statusEl) { statusEl.textContent = 'Cancelando...'; statusEl.className = 'mt-3 text-xs text-center text-gray-300'; }
+
+            try {
+                const resp = await fetch(`/api/schedule/${_cancelJobId}`, {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+                const data = await resp.json();
+                if (resp.ok && data.ok) {
+                    hideCancelModal();
+                    loadSchedule();
+                } else {
+                    if (statusEl) { statusEl.textContent = '❌ ' + (data.error || 'Error'); statusEl.className = 'mt-3 text-xs text-center text-red-400'; }
+                    if (resp.status === 401) document.getElementById('cancel-password').value = '';
+                }
+            } catch (e) {
+                if (statusEl) { statusEl.textContent = '❌ Error de conexión.'; statusEl.className = 'mt-3 text-xs text-center text-red-400'; }
+            }
+        }
+
+        // ---- FIN MÓDULO DE PLANIFICACIÓN ----
+
+
         // --- INICIALIZACIÓN --
         
         document.addEventListener('DOMContentLoaded', () => {
