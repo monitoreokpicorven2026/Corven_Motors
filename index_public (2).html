@@ -1,0 +1,840 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Monitor CFW500 - FAD (Solo Lectura)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/moment@2.30.1/moment.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-moment@1.0.1/dist/chartjs-adapter-moment.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+    <style>
+        /* Personalización mínima */
+        body { font-family: 'Inter', sans-serif; }
+        .sidebar { background-color: #3a3f51; }
+        .card { 
+            background-color: #343842; 
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2); 
+            border-radius: 0.5rem; /* Bordes redondeados */
+        }
+        .menu-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 12px;
+            cursor: pointer;
+            transition: background-color 0.2s, color 0.2s, border-left 0.2s;
+            border-left: 4px solid transparent;
+        }
+        .menu-item.active, .menu-item:hover {
+            color: white;
+            background-color: #2c2f3a;
+        }
+        .menu-item.active {
+            border-left: 4px solid #f18f01;
+            font-weight: 600;
+        }
+        /* Estilos específicos para los gráficos en la página de Reportes */
+        .chart-container {
+            position: relative;
+            height: 40vh;
+            width: 100%;
+            margin-bottom: 2rem;
+            padding: 1rem;
+            background-color: #2c2f3a;
+            border-radius: 0.5rem;
+        }
+        /* Estilos para la tabla de historial */
+        .table-header { background-color: #3a3f51; color: #f18f01; }
+        /* Animación de pulso para la alerta */
+        @keyframes pulse-red {
+            0%, 100% { background-color: #b91c1c; }
+            50% { background-color: #ef4444; }
+        }
+        .alert-pulse {
+            animation: pulse-red 1s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+    </style>
+</head>
+<body class="bg-[#2c2f3a] text-gray-100 min-h-screen">
+
+    <div class="flex flex-col lg:flex-row min-h-screen">
+        <aside class="sidebar lg:w-64 p-6 flex flex-col gap-6 lg:h-auto h-20">
+            <div class="text-2xl font-bold text-white lg:mb-8 hidden lg:block">FAD</div>
+            <nav class="flex lg:flex-col space-x-4 lg:space-x-0 lg:space-y-3 font-semibold text-gray-400">
+                <a id="nav-main" class="menu-item active" onclick="loadPage('main')">
+                    <span>Principal</span>
+                </a>
+                <a id="nav-reports" class="menu-item" onclick="loadPage('reports')">
+                    <span>Reportes</span>
+                </a>
+                <a id="nav-history" class="menu-item" onclick="loadPage('history')">
+                    <span>Historial de Frecuencia</span>
+                </a>
+            </nav>
+        </aside>
+
+        <main id="page-content" class="flex-1 p-6 lg:p-10 overflow-y-auto">
+        </main>
+    </div>
+
+    <script>
+        // ======================================================================
+        // INFLUXDB CLOUD — se consulta directo desde el navegador, sin pasar
+        // por la Raspberry. Mismo mecanismo que ya usás en tus otros paneles.
+        //
+        // Completá estos 4 datos desde tu cuenta de InfluxDB Cloud
+        // (Load Data > API Tokens / Buckets):
+        // ======================================================================
+        const INFLUX_URL   = 'https://TU-REGION.aws.cloud2.influxdata.com'; // sin barra final
+        const INFLUX_ORG   = 'TU-ORGANIZACION';
+        const INFLUX_BUCKET = 'cfw500';
+        const INFLUX_TOKEN = 'TU-TOKEN-DE-SOLO-LECTURA';
+
+        // Tienen que coincidir con lo que escribe el script de la Raspberry
+        // (influx_store.py: INFLUX_MEASUREMENT / INFLUX_DEVICE).
+        const INFLUX_MEASUREMENT = 'cfw500';
+        const INFLUX_DEVICE = 'vdf-1';
+
+        // Banda de alerta solo para pintar el panel de este HTML público.
+        // Es una copia de MIN_FREQ_ALERT/MAX_FREQ_ALERT del backend: si cambiás
+        // la banda desde el panel local, actualizá también estos dos números.
+        const BAND_MIN = 5.0;
+        const BAND_MAX = 46.0;
+
+        // ---- Aviso de "sin datos" (falla de red, token vencido, CORS, etc.) ----
+        function setBackendOffline(isOffline, detail) {
+            let el = document.getElementById('backend-offline-banner');
+            if (!el) {
+                el = document.createElement('div');
+                el.id = 'backend-offline-banner';
+                el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;' +
+                    'background:#b91c1c;color:#fff;padding:8px 12px;text-align:center;' +
+                    'font-size:14px;font-family:sans-serif;display:none';
+                document.body.appendChild(el);
+            }
+            if (isOffline) {
+                el.textContent = 'No se pudo leer InfluxDB' + (detail ? ' (' + detail + ')' : '') +
+                    '. Los datos mostrados pueden estar desactualizados.';
+                el.style.display = 'block';
+            } else {
+                el.style.display = 'none';
+            }
+        }
+
+        // ---- Cliente Flux mínimo (POST + parseo de "annotated CSV") ----
+        async function fluxQuery(fluxBody) {
+            let resp;
+            try {
+                resp = await fetch(`${INFLUX_URL}/api/v2/query?org=${encodeURIComponent(INFLUX_ORG)}`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Token ${INFLUX_TOKEN}`,
+                        'Content-Type': 'application/vnd.flux',
+                        'Accept': 'application/csv'
+                    },
+                    body: fluxBody
+                });
+            } catch (e) {
+                // Esto salta por red caída, o por CORS si Influx Cloud no lo habilita
+                // para este origen (poco común, pero puede pasar según el plan).
+                setBackendOffline(true, 'red o CORS');
+                throw e;
+            }
+            if (!resp.ok) {
+                const text = await resp.text().catch(() => '');
+                setBackendOffline(true, `HTTP ${resp.status}`);
+                throw new Error(`Influx query error ${resp.status}: ${text.slice(0, 200)}`);
+            }
+            setBackendOffline(false);
+            return parseAnnotatedCSV(await resp.text());
+        }
+
+        // Parsea el formato "annotated CSV" que devuelve /api/v2/query.
+        // Devuelve [{ts: "2026-01-01T00:00:10", value: 49.5}, ...]
+        function parseAnnotatedCSV(text) {
+            const rows = [];
+            let timeIdx = -1, valueIdx = -1;
+            for (const rawLine of text.split('\n')) {
+                const line = rawLine.replace(/\r$/, '');
+                if (!line || line.startsWith('#')) continue;
+                const cols = line.split(',');
+                if (cols[0] === '' && cols[1] === 'result') {
+                    // Línea de encabezado (puede repetirse si hay varias tablas)
+                    timeIdx = cols.indexOf('_time');
+                    valueIdx = cols.indexOf('_value');
+                    continue;
+                }
+                if (timeIdx === -1 || valueIdx === -1) continue;
+                if (cols.length <= Math.max(timeIdx, valueIdx)) continue;
+                const v = parseFloat(cols[valueIdx]);
+                if (Number.isNaN(v)) continue;
+                // "2026-01-01T00:00:10Z" -> quitamos la Z para que el resto del
+                // código (Chart.js, moment, etc.) lo trate como hora local, igual
+                // que antes con los timestamps que venían de SQLite.
+                const ts = cols[timeIdx].replace('Z', '');
+                rows.push({ ts, value: v });
+            }
+            return rows;
+        }
+
+        const fluxFilter = `r._measurement == "${INFLUX_MEASUREMENT}" and r.device == "${INFLUX_DEVICE}"`;
+
+        // Últimas N muestras crudas
+        async function influxLatest(field = 'freq_hz', limit = 500, lookback = '7d') {
+            return fluxQuery(`
+from(bucket: "${INFLUX_BUCKET}")
+  |> range(start: -${lookback})
+  |> filter(fn: (r) => ${fluxFilter})
+  |> filter(fn: (r) => r._field == "${field}")
+  |> keep(columns: ["_time", "_value"])
+  |> tail(n: ${limit})`);
+        }
+
+        // Promedio por hora, últimas N horas
+        async function influxHourly(field = 'freq_hz', hours = 24) {
+            return fluxQuery(`
+from(bucket: "${INFLUX_BUCKET}")
+  |> range(start: -${hours}h)
+  |> filter(fn: (r) => ${fluxFilter})
+  |> filter(fn: (r) => r._field == "${field}")
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> keep(columns: ["_time", "_value"])`);
+        }
+
+        // Promedio por día, últimos N días
+        async function influxDaily(field = 'freq_hz', days = 30) {
+            return fluxQuery(`
+from(bucket: "${INFLUX_BUCKET}")
+  |> range(start: -${days}d)
+  |> filter(fn: (r) => ${fluxFilter})
+  |> filter(fn: (r) => r._field == "${field}")
+  |> aggregateWindow(every: 1d, fn: mean, createEmpty: false)
+  |> keep(columns: ["_time", "_value"])`);
+        }
+
+        // Rango de fechas puntual, para los CSV de descarga
+        async function influxRange(startDate, endDate, field = 'freq_hz') {
+            return fluxQuery(`
+from(bucket: "${INFLUX_BUCKET}")
+  |> range(start: ${startDate}T00:00:00Z, stop: ${endDate}T23:59:59Z)
+  |> filter(fn: (r) => ${fluxFilter})
+  |> filter(fn: (r) => r._field == "${field}")
+  |> keep(columns: ["_time", "_value"])
+  |> sort(columns: ["_time"])`);
+        }
+
+        // Último valor de un campo (para "Frecuencia actual", "Referencia", etc.)
+        async function influxLastValue(field = 'freq_hz') {
+            const rows = await fluxQuery(`
+from(bucket: "${INFLUX_BUCKET}")
+  |> range(start: -7d)
+  |> filter(fn: (r) => ${fluxFilter})
+  |> filter(fn: (r) => r._field == "${field}")
+  |> last()
+  |> keep(columns: ["_time", "_value"])`);
+            return rows.length ? rows[rows.length - 1] : null;
+        }
+
+        // Descarga un array [{ts,value}] como CSV, sin pasar por ningún backend
+        function downloadRowsAsCSV(rows, filename, header = 'Fecha,Hora,Un_Hs') {
+            const lines = [header];
+            for (const r of rows) {
+                const dt = new Date(r.ts.endsWith('Z') ? r.ts : r.ts + 'Z');
+                const fecha = dt.toLocaleDateString('es-AR');
+                const hora = dt.toLocaleTimeString('es-AR', { hour12: false });
+                lines.push(`${fecha},${hora},${r.value}`);
+            }
+            const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+        }
+
+
+        // La modificación de frecuencia/banda queda exclusivamente en la página LOCAL (LAN/Tailscale).
+        const newControlPanelHTML = `
+            <div id="band-alert-banner" class="hidden alert-pulse p-4 rounded-lg mb-4 text-center font-bold text-white shadow-xl">
+                ⚠️ ¡ALERTA! FRECUENCIA DE REFERENCIA FUERA DE BANDA ⚠️
+            </div>
+
+            <hr class="my-4 border-gray-600">
+
+            <div class="flex justify-between items-center text-sm text-gray-300 bg-[#2c2f3a] p-3 rounded">
+                <span>Banda de Alerta configurada:</span>
+                <span id="current-band-limits" class="font-mono text-gray-200">-- Hz</span>
+            </div>
+            <p class="mt-3 text-xs text-center text-gray-500">
+                Esta es una vista de solo lectura. La modificación de parámetros solo está disponible desde la red local.
+            </p>
+        `;
+
+        // --- DEFINICIÓN DE CONTENIDOS DE PÁGINA ---
+
+        // 1. Contenido de la página PRINCIPAL (Control del variador)
+        const mainContentHTML = `
+            <div class="content-container">
+                <h1 class="text-3xl font-bold mb-6 text-white">Control del Variador CFW500</h1>
+
+                <div class="grid grid-cols-1 gap-6">
+
+                    <div id="params-card" class="card p-6 rounded-lg">
+                        <h2 class="text-xl font-semibold mb-4 text-[#45e545]">Parámetros de Operación</h2>
+                        <div class="space-y-4">
+                            <p class="flex justify-between items-center text-lg">
+                                <span>Frecuencia Actual (Medida):</span>
+                                <span id="actual-freq" class="font-mono text-2xl text-yellow-300">-- Hz</span>
+                            </p>
+                            <p class="flex justify-between items-center text-lg">
+                                <span>Frecuencia de Referencia:</span>
+                                <span id="target-freq" class="font-mono text-2xl text-orange-400">-- Hz</span>
+                            </p>
+                        </div>
+                        ${newControlPanelHTML}
+                    </div>
+                </div>
+
+                <div id="safety-card" class="card p-6 rounded-lg mt-6">
+                    <h2 class="text-xl font-semibold mb-4 text-yellow-500 flex items-center gap-2">
+                        Dias sin Accidentes
+                    </h2>
+                    <p id="safety-status" class="text-2xl font-mono text-center mb-2">--</p>
+                    <p id="last-accident-ts" class="text-sm text-center text-gray-400">Último incidente: --</p>
+                </div>
+
+                <div id="accident-history-card" class="card p-6 rounded-lg mt-6">
+                    <h2 class="text-xl font-semibold mb-4 text-red-400 flex items-center gap-2">
+                        Historial de Reinicios de Seguridad
+                    </h2>
+                    <div class="overflow-x-auto shadow-md rounded-lg">
+                        <table class="min-w-full divide-y divide-gray-600">
+                            <thead class="table-header bg-red-800/50">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-red-300">Fecha y Hora</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-red-300">Motivo del Reinicio</th>
+                                </tr>
+                            </thead>
+                            <tbody id="accident-history-list" class="bg-[#2c2f3a] divide-y divide-gray-700">
+                                <tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">Cargando historial...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <p id="accident-history-status" class="mt-4 text-sm text-center text-gray-400"></p>
+                </div>
+            </div>
+
+        `;
+
+        // 2. Contenido de la página REPORTES (Gráficos)
+        const reportsContentHTML = `
+            <div class="content-container">
+                <h1 class="text-3xl font-bold mb-6 text-white">Reportes de Frecuencia y Seguridad</h1>
+                
+                <div class="card p-4 rounded-lg mb-6">
+                    <h2 class="text-xl font-semibold mb-2 text-[#45e545]">Frecuencia en Tiempo Real (Un_Hs)</h2>
+                    
+                    <div class="flex justify-between items-center mb-4"> 
+                        <p class="text-sm text-gray-400">Muestra la frecuencia completa. Usa el zoom (rueda del ratón) y desplazamiento (clic y arrastrar) para explorar.</p>
+                        <button onclick="resetZoom()" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-1 px-3 rounded text-sm transition duration-200 flex items-center gap-1">
+                            Reiniciar Zoom
+                        </button>
+                    </div>
+                    
+                    <div class="chart-container">
+                        <canvas id="realTimeChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <div class="card p-4 rounded-lg">
+                        <h2 class="text-xl font-semibold mb-2 text-yellow-300">Promedio Diario (Últimas 24 Horas)</h2>
+                        <div class="chart-container">
+                            <canvas id="hourlyChart"></canvas>
+                        </div>
+                    </div>
+                    <div class="card p-4 rounded-lg">
+                        <h2 class="text-xl font-semibold mb-2 text-orange-400">Promedio Mensual (Últimos 30 Días)</h2>
+                        <div class="chart-container">
+                            <canvas id="monthlyChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        `;
+
+        // 3. Contenido de la página HISTORIAL DE FRECUENCIA
+        const historyContentHTML = `
+            <div class="content-container">
+                <h1 class="text-3xl font-bold mb-6 text-white">Historial de Frecuencia Detallado</h1>
+                <div class="card p-6 rounded-lg">
+                    
+                    <div class="mb-6 border border-gray-600 p-4 rounded bg-[#3a3f51]">
+                        <h3 class="text-lg font-semibold mb-3 text-[#45e545]">Descarga de Datos por Período</h3>
+                        <p class="text-sm text-gray-300 mb-4">Seleccione un rango de fechas para descargar solo los registros necesarios. Esto permite obtener el historial completo sin límites de registros.</p>
+                        <div class="flex flex-col md:flex-row gap-4 items-end">
+                            <div class="flex-1 w-full">
+                                <label for="start-date-input" class="block mb-1 text-sm font-medium">Fecha de Inicio (YYYY-MM-DD):</label>
+                                <input type="date" id="start-date-input" class="w-full p-2 rounded bg-[#2c2f3a] border border-gray-600 text-white">
+                            </div>
+                            <div class="flex-1 w-full">
+                                <label for="end-date-input" class="block mb-1 text-sm font-medium">Fecha de Fin (YYYY-MM-DD):</label>
+                                <input type="date" id="end-date-input" class="w-full p-2 rounded bg-[#2c2f3a] border border-gray-600 text-white">
+                            </div>
+                            <button id="download-range-btn" onclick="exportFrequencyHistoryByRange()" class="w-full md:w-auto bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded transition duration-200 text-sm flex items-center justify-center gap-1 mt-2 md:mt-0">
+                                Descargar Rango
+                            </button>
+                        </div>
+                    </div>
+                    <div class="flex justify-between items-center mb-4 flex-col sm:flex-row border-t border-gray-700 pt-4">
+                        <p id="status-message" class="mb-2 sm:mb-0 text-sm text-gray-400">Mostrando los últimos 500 registros. Use la opción superior para obtener el historial completo.</p>
+                        <button id="download-history-btn" onclick="exportAllFrequencyHistoryToCSV()" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition duration-200 text-sm flex items-center gap-1">
+                            Descargar TODO
+                        </button>
+                    </div>
+                    
+                    <div class="overflow-x-auto shadow-md rounded-lg">
+                        <table class="min-w-full divide-y divide-gray-600">
+                            <thead class="table-header">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-[#45e545]">Timestamp</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-[#45e545]">Frecuencia (Hz)</th>
+                                </tr>
+                            </thead>
+                            <tbody id="frequency-history-list" class="bg-[#2c2f3a] divide-y divide-gray-700">
+                                <tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">No hay datos disponibles para mostrar.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <p id="history-loading-status" class="mt-4 text-sm text-center text-gray-400"></p>
+                </div>
+            </div>
+        `;
+
+        // --- FUNCIONES Y LÓGICA DE CONTROL ---
+
+        // Función de polling para actualizar el estado (lee último valor de Influx)
+        async function updateStatus() {
+            try {
+                const [freqRow, targetRow] = await Promise.all([
+                    influxLastValue('freq_hz'),
+                    influxLastValue('target_freq_hz')
+                ]);
+
+                const actualEl = document.getElementById('actual-freq');
+                const targetEl = document.getElementById('target-freq');
+                const measured = freqRow ? freqRow.value : null;
+                const ref = targetRow ? targetRow.value : null;
+
+                if (actualEl) actualEl.textContent = measured !== null ? `${measured.toFixed(2)} Un_Hs` : '-- Hz';
+                if (targetEl) targetEl.textContent = ref !== null ? `${ref.toFixed(2)} Hz` : '-- Hz';
+
+                // Banda de alerta: constante local (ver BAND_MIN/BAND_MAX arriba),
+                // no viene de la Raspberry en este panel público.
+                const currentBandLimits = document.getElementById('current-band-limits');
+                if (currentBandLimits) {
+                    currentBandLimits.textContent = `${BAND_MIN.toFixed(2)} - ${BAND_MAX.toFixed(2)} Hz`;
+                }
+
+                const alertActive = measured !== null && (measured < BAND_MIN || measured > BAND_MAX);
+                const alertBanner = document.getElementById('band-alert-banner');
+                const paramsCard = document.getElementById('params-card');
+
+                if (alertActive) {
+                    if (alertBanner) alertBanner.classList.remove('hidden');
+                    if (paramsCard) paramsCard.classList.add('border-4', 'border-red-700');
+                } else {
+                    if (alertBanner) alertBanner.classList.add('hidden');
+                    if (paramsCard) paramsCard.classList.remove('border-4', 'border-red-700');
+                }
+            } catch (error) {
+                console.error('Error fetching status:', error);
+            }
+        }
+
+        // Función de inicialización de la página 'main'
+        // (Sin listeners de escritura: esta página es solo lectura)
+        function setupMainPage() {
+            
+            const bandForm = document.getElementById('set-band-form');
+            if (bandForm) bandForm.addEventListener('submit', setBandLimits);
+
+            // Iniciar la actualización de estado y el polling
+            updateStatus(); 
+            if (!window.statusInterval) { // Prevenir múltiples intervalos
+                window.statusInterval = setInterval(updateStatus, 3000); 
+            }
+
+            // Llamar a las funciones de seguridad y historial
+            getSafetyStatus(); 
+            getAccidentHistory(); 
+        }
+
+        // Sobrescribir la función loadPage para incluir la lógica de setup
+        window.loadPage = (page) => {
+            const contentEl = document.getElementById('page-content');
+            
+            if (page === 'main') {
+                contentEl.innerHTML = mainContentHTML;
+                setupMainPage(); 
+            } else if (page === 'reports') {
+                contentEl.innerHTML = reportsContentHTML;
+                setTimeout(() => {
+                    // Esperar a que el DOM se renderice antes de inicializar Chart.js
+                    initRealTimeChart();
+                    initHourlyChart();
+                    initMonthlyChart();
+                }, 100); 
+            } else if (page === 'history') {
+                contentEl.innerHTML = historyContentHTML;
+                getFrequencyHistory(); 
+            }
+
+            // Actualizar clases de navegación
+            document.querySelectorAll('.menu-item').forEach(item => {
+                item.classList.remove('active');
+            });
+            const navItem = document.getElementById(`nav-${page}`);
+            if(navItem) navItem.classList.add('active');
+
+            // Detener polling al salir de la página principal 
+            if (page !== 'main' && window.statusInterval) {
+                 clearInterval(window.statusInterval);
+                 window.statusInterval = null;
+            }
+        }
+
+        // --- FUNCIONES DE SEGURIDAD (IMPLEMENTADAS) ---
+
+        // Días sin accidentes, historial de reinicios y reset de contador son
+        // datos relacionales (SQLite en la Raspberry), no series temporales, así
+        // que no salen de InfluxDB. Dejá REMOTE_API_BASE vacío si por ahora solo
+        // querés los gráficos de frecuencia (esta sección se muestra como "no
+        // disponible"). Si más adelante exponés el Flask por HTTPS (Tailscale
+        // Funnel, Cloudflare Tunnel, etc.), completá la URL acá y se activa sola.
+        const REMOTE_API_BASE = ''; // ej: 'https://rpi-planta.tailXXXX.ts.net'
+
+        async function remoteFetch(path, options) {
+            if (!REMOTE_API_BASE) return null; // sección deshabilitada a propósito
+            return fetch(REMOTE_API_BASE + path, options);
+        }
+
+        async function getSafetyStatus() {
+            const safetyEl = document.getElementById('safety-status');
+            const lastEl = document.getElementById('last-accident-ts');
+            try {
+                const response = await remoteFetch('/api/time_since_accident');
+                if (!response) {
+                    if (safetyEl) safetyEl.textContent = 'No disponible en este panel';
+                    if (lastEl) lastEl.textContent = '';
+                    return;
+                }
+                const data = await response.json();
+
+                // manejar varios posibles nombres de campos que pueda enviar el backend
+                const days = (data && (data.days_since ?? data.daysSince ?? data.days)) ?? '--';
+                const lastTs = (data && (data.last_ts || data.last_accident_ts || data.lastAccidentTs)) || '--';
+                
+                if (safetyEl) safetyEl.textContent = `${days} días`;
+                if (lastEl) lastEl.textContent = `Último incidente: ${lastTs}`;
+            } catch (error) {
+                console.error('Error fetching safety status:', error);
+                if (safetyEl) safetyEl.textContent = '--';
+            }
+        }
+
+        async function getAccidentHistory() {
+            const listEl = document.getElementById('accident-history-list');
+            if (!listEl) return; 
+
+            try {
+                const response = await remoteFetch('/api/accident_history');
+                if (!response) {
+                    listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">No disponible en este panel.</td></tr>';
+                    return;
+                }
+                const history = await response.json();
+
+                listEl.innerHTML = ''; // Limpiar
+                if (!history || history.length === 0) {
+                    listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">No hay historial de reinicios.</td></tr>';
+                    return;
+                }
+
+                history.forEach(item => {
+                    const ts = item.timestamp || item.reset_ts || item.ts || '';
+                    const row = `
+                        <tr class="hover:bg-[#3a3f51]">
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-300">${ts}</td>
+                            <td class="px-6 py-4 text-sm text-gray-400">${item.reason || item.motivo || ''}</td>
+                        </tr>
+                    `;
+                    listEl.innerHTML += row;
+                });
+
+            } catch (error) {
+                console.error('Error fetching accident history:', error);
+                listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-red-500">Error cargando historial.</td></tr>';
+            }
+        }
+
+        // --- FUNCIONES DE REPORTES (IMPLEMENTADAS) ---
+
+        let realTimeChart = null;
+        let hourlyChart = null;
+        let monthlyChart = null;
+        
+        function resetZoom() {
+            if (realTimeChart && typeof realTimeChart.resetZoom === 'function') {
+                realTimeChart.resetZoom();
+            }
+        }
+
+        // --- FUNCIONES CORREGIDAS PARA CHARTS (usar objetos {x,y}) ---
+
+        async function initRealTimeChart() {
+            const ctx = document.getElementById('realTimeChart')?.getContext('2d');
+            if (!ctx) return;
+
+            try {
+                const response = await apiFetch('/api/measurements?mode=latest');
+                const data = await response.json();
+
+                const chartData = (Array.isArray(data) ? data : []).map(d => ({ x: d.ts, y: d.value * 1.034 }));
+
+                if (realTimeChart) realTimeChart.destroy();
+
+                realTimeChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        datasets: [{
+                            label: 'Frecuencia (Un_Hs)',
+                            data: chartData,
+                            borderColor: '#f18f01',
+                            backgroundColor: 'rgba(241, 143, 1, 0.2)',
+                            borderWidth: 2,
+                            pointRadius: 0,
+                            tension: 0.1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            x: {
+                                type: 'time',
+                                time: { unit: 'second', tooltipFormat: 'YYYY-MM-DD HH:mm:ss' },
+                                title: { display: true, text: 'Tiempo', color: '#c6c8d6' },
+                                ticks: { color: '#c6c8d6' },
+                                grid: { color: 'rgba(255, 255, 255, 0.1)' }
+                            },
+                            y: {
+                                title: { display: true, text: 'Frecuencia (Un_Hs)', color: '#c6c8d6' },
+                                ticks: { color: '#c6c8d6' },
+                                grid: { color: 'rgba(255, 255, 255, 0.1)' },
+                                min: 0,
+                                max: 60
+                            }
+                        },
+                        plugins: {
+                            legend: { labels: { color: '#c6c8d6' } },
+                            zoom: {
+                                pan: { enabled: true, mode: 'x', modifierKey: 'shift' },
+                                zoom: {
+                                    wheel: { enabled: true },
+                                    pinch: { enabled: true },
+                                    mode: 'x',
+                                }
+                            }
+                        }
+                    }
+                });
+
+            } catch (error) {
+                console.error('Error cargando gráfico tiempo real:', error);
+                if (ctx && ctx.parentElement) ctx.parentElement.innerHTML = '<p class="text-red-500 p-4">Error cargando datos de tiempo real.</p>';
+            }
+        }
+
+        async function initHourlyChart() {
+            const ctx = document.getElementById('hourlyChart')?.getContext('2d');
+            if (!ctx) return;
+            
+            try {
+                const response = await apiFetch('/api/measurements?mode=hourly');
+                const data = await response.json();
+
+                const chartData = (Array.isArray(data) ? data : []).map(d => ({ x: d.ts, y: d.value * 1.034 }));
+
+                if (hourlyChart) hourlyChart.destroy();
+
+                hourlyChart = new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        datasets: [{
+                            label: 'Unidad Promedio (24HS)',
+                            data: chartData,
+                            backgroundColor: '#45e545',
+                            borderColor: '#45e545',
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            x: {
+                                type: 'time',
+                                time: { unit: 'hour', tooltipFormat: 'YYYY-MM-DD HH:mm' },
+                                title: { display: true, text: 'Hora', color: '#c6c8d6' },
+                                ticks: { color: '#c6c8d6' },
+                                grid: { color: 'rgba(255, 255, 255, 0.1)' }
+                            },
+                            y: {
+                                title: { display: true, text: 'Frecuencia Promedio (Un_Hs)', color: '#c6c8d6' },
+                                ticks: { color: '#c6c8d6' },
+                                grid: { color: 'rgba(255, 255, 255, 0.1)' },
+                                min: 0,
+                                max: 60
+                            }
+                        },
+                        plugins: {
+                            legend: { labels: { color: '#c6c8d6' } }
+                        }
+                    }
+                });
+
+            } catch (error) {
+                console.error('Error cargando gráfico por hora:', error);
+                if (ctx && ctx.parentElement) ctx.parentElement.innerHTML = '<p class="text-red-500 p-4">Error cargando datos por hora.</p>';
+            }
+        }
+
+        async function initMonthlyChart() {
+            const ctx = document.getElementById('monthlyChart')?.getContext('2d');
+            if (!ctx) return;
+            
+            try {
+                const response = await apiFetch('/api/measurements?mode=monthly');
+                const data = await response.json();
+
+                const chartData = (Array.isArray(data) ? data : []).map(d => ({ x: d.ts, y: d.value * 1.034 }));
+
+                if (monthlyChart) monthlyChart.destroy();
+
+                monthlyChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        datasets: [{
+                            label: 'Unidad promedio (MENSUAL)',
+                            data: chartData,
+                            borderColor: '#ffa500',
+                            backgroundColor: 'rgba(255,165,0,0.2)',
+                            borderWidth: 2,
+                            tension: 0.3,
+                            pointRadius: 3
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            x: {
+                                type: 'time',
+                                time: { unit: 'day', tooltipFormat: 'YYYY-MM-DD' },
+                                title: { display: true, text: 'Día', color: '#c6c8d6' },
+                                ticks: { color: '#c6c8d6' },
+                                grid: { color: 'rgba(255,255,255,0.1)' }
+                            },
+                            y: {
+                                title: { display: true, text: 'Promedio diario (Un/Dia)', color: '#c6c8d6' },
+                                ticks: { color: '#c6c8d6' },
+                                grid: { color: 'rgba(255,255,255,0.1)' },
+                                min: 0,
+                                max: 60
+                            }
+                        },
+                        plugins: { legend: { labels: { color: '#c6c8d6' } } }
+                    }
+                });
+            } catch (error) {
+                console.error('Error cargando gráfico mensual:', error);
+                if (ctx && ctx.parentElement) ctx.parentElement.innerHTML = '<p class="text-red-500 p-4">Error cargando datos mensuales.</p>';
+            }
+        }
+
+        // --- FUNCIONES DE HISTORIAL (IMPLEMENTADAS) ---
+
+        async function getFrequencyHistory() {
+            const listEl = document.getElementById('frequency-history-list');
+            const statusEl = document.getElementById('history-loading-status');
+            if (!listEl) return;
+
+            if (statusEl) statusEl.textContent = 'Cargando últimos 500 registros...';
+            listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">Cargando...</td></tr>';
+            
+            try {
+                const response = await apiFetch('/api/measurements?mode=latest');
+                const data = await response.json();
+                
+                listEl.innerHTML = ''; // Limpiar
+                if (!data || data.length === 0) {
+                    listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-gray-500">No hay datos de frecuencia recientes.</td></tr>';
+                    if (statusEl) statusEl.textContent = 'Carga completa.';
+                    return;
+                }
+
+                data.forEach(item => {
+                    const timestamp = moment(item.ts).format('YYYY-MM-DD HH:mm:ss');
+                    const row = `
+                        <tr class="hover:bg-[#3a3f51]">
+                            <td class="px-6 py-2 whitespace-nowrap text-sm font-medium text-gray-300">${timestamp}</td>
+                            <td class="px-6 py-2 whitespace-nowrap text-sm text-gray-400">${(item.value ?? 0).toFixed(2)} Hz</td>
+                        </tr>
+                    `;
+                    listEl.innerHTML += row;
+                });
+                if (statusEl) statusEl.textContent = `Carga completa. Mostrando ${data.length} registros.`;
+                
+            } catch (error) {
+                console.error('Error fetching frequency history:', error);
+                listEl.innerHTML = '<tr><td colspan="2" class="px-6 py-4 text-center text-red-500">Error cargando historial de frecuencia.</td></tr>';
+                if (statusEl) statusEl.textContent = 'Error al cargar datos.';
+            }
+        }
+
+        function exportFrequencyHistoryByRange() {
+            const startDate = document.getElementById('start-date-input').value;
+            const endDate = document.getElementById('end-date-input').value;
+            
+            if (!startDate || !endDate) {
+                alert('Debe seleccionar tanto la Fecha de Inicio como la Fecha de Fin.');
+                return;
+            }
+
+            const url = apiUrl(`/history_csv?start_date=${startDate}&end_date=${endDate}`);
+            window.location.href = url;
+        }
+
+        function exportAllFrequencyHistoryToCSV() {
+            const url = apiUrl(`/history_csv`);
+            window.location.href = url;
+        }
+        
+        // --- INICIALIZACIÓN --
+        
+        document.addEventListener('DOMContentLoaded', () => {
+            // Inicializar la página en 'main'
+            window.loadPage('main');
+        });
+
+    </script>
+</body>
+</html>
